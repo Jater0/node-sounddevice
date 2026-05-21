@@ -1,0 +1,9 @@
+{
+  "name": "node-sounddevice-native",
+  "private": true,
+  "scripts": {
+    "build": "cargo build --release && node ../scripts/copy-artifact.js",
+    "build:debug": "cargo build",
+    "clean": "cargo clean"
+  }
+}

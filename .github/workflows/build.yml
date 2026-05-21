@@ -1,0 +1,75 @@
+name: Build & Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ─── TypeScript 编译检查 ──────────────────────
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: node-sounddevice/package-lock.json
+      - run: npm ci
+        working-directory: node-sounddevice
+      - run: npx tsc --noEmit
+        working-directory: node-sounddevice
+
+  # ─── 单元测试 ─────────────────────────────────
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: node-sounddevice/package-lock.json
+      - run: npm ci
+        working-directory: node-sounddevice
+      - run: npm test
+        working-directory: node-sounddevice
+
+  # ─── Rust 原生插件构建 (各平台) ──────────────
+  build-native:
+    needs: [typecheck]
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact: darwin-x64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: darwin-arm64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: linux-x64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: win32-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: ${{ matrix.target }}
+      - name: Build native addon
+        run: cargo build --release --target ${{ matrix.target }}
+        working-directory: node-sounddevice/backends/portaudio/native
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.artifact }}
+          path: |
+            node-sounddevice/backends/portaudio/native/target/${{ matrix.target }}/release/*.node
+            node-sounddevice/backends/portaudio/native/target/${{ matrix.target }}/release/*.dll
+            node-sounddevice/backends/portaudio/native/target/${{ matrix.target }}/release/*.dylib
+            node-sounddevice/backends/portaudio/native/target/${{ matrix.target }}/release/*.so
