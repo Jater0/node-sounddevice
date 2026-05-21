@@ -5,15 +5,13 @@
  * Copies the compiled .node addon and PortAudio runtime DLL to:
  *   1. The native source directory (for tsx dev server)
  *   2. The dist/ directory (for compiled distribution)
- *
- * Called by: cargo build && node copy-artifact.js
  */
 
 const fs = require('fs');
 const path = require('path');
 
 const targetDir = path.join(__dirname, 'target');
-const nativeDir = __dirname; // backends/portaudio/native/
+const nativeDir = __dirname;
 const distDir = path.join(__dirname, '..', '..', '..', 'dist', 'backends', 'portaudio', 'native');
 
 // Find the built .node file
@@ -28,36 +26,35 @@ const addonFile = files.find(f => f.endsWith('.dll') && f.startsWith('node_sound
 
 if (!addonFile) {
   console.error('Error: Could not find built addon in', buildDir);
-  console.error('Files:', files.join(', '));
   process.exit(1);
 }
 
 const src = path.join(buildDir, addonFile);
 
-// Copy to source directory (for tsx development)
-const srcDest = path.join(nativeDir, 'index.node');
-fs.copyFileSync(src, srcDest);
-console.log(`Copied ${addonFile} -> ${path.relative(process.cwd(), srcDest)}`);
-
-// Copy to dist directory (for compiled distribution)
-if (fs.existsSync(path.dirname(distDir))) {
-  fs.mkdirSync(distDir, { recursive: true });
-  const distDest = path.join(distDir, 'index.node');
-  fs.copyFileSync(src, distDest);
-  console.log(`Copied ${addonFile} -> ${path.relative(process.cwd(), distDest)}`);
-}
-
-// Copy the PortAudio DLL next to both destinations (Windows runtime dependency)
-const paDll = files.find(f => f.includes('portaudio') && f.endsWith('.dll'));
-if (paDll) {
-  const paSrc = path.join(buildDir, paDll);
-
-  const paSrcDest = path.join(nativeDir, paDll);
-  fs.copyFileSync(paSrc, paSrcDest);
-
-  if (fs.existsSync(path.dirname(distDir))) {
-    const paDistDest = path.join(distDir, paDll);
-    fs.copyFileSync(paSrc, paDistDest);
+function copyToDir(destDir) {
+  fs.mkdirSync(destDir, { recursive: true });
+  // Copy addon as index.node
+  fs.copyFileSync(src, path.join(destDir, 'index.node'));
+  // Copy PortAudio runtime libraries (DLL/dylib/so), keep original names
+  const paFiles = files.filter(f =>
+    (f.includes('portaudio') || f.endsWith('.dylib') || f.endsWith('.so')) &&
+    f !== addonFile &&
+    !f.endsWith('.exp') &&
+    !f.endsWith('.lib') &&
+    !f.endsWith('.pdb')
+  );
+  for (const pa of paFiles) {
+    fs.copyFileSync(path.join(buildDir, pa), path.join(destDir, pa));
   }
-  console.log(`Copied ${paDll} (runtime dependency)`);
+  return paFiles;
 }
+
+// Copy to source directory
+const pas1 = copyToDir(nativeDir);
+console.log(`Copied ${addonFile} -> index.node (native/)`);
+if (pas1.length) console.log(`Copied runtime: ${pas1.join(', ')}`);
+
+// Copy to dist directory
+const pas2 = copyToDir(distDir);
+console.log(`Copied ${addonFile} -> index.node (dist/)`);
+if (pas2.length) console.log(`Copied runtime: ${pas2.join(', ')}`);

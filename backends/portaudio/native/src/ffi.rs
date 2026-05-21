@@ -212,8 +212,22 @@ pub type PaStreamFinishedCallback =
 
 // ─── FFI Declarations ─────────────────────────────
 
-#[cfg_attr(target_os = "windows", link(name = "portaudio", kind = "raw-dylib"))]
-#[cfg_attr(not(target_os = "windows"), link(name = "portaudio"))]
+// Link the correct PortAudio binary per platform & architecture.
+// Names match the files in portaudio-binaries/ exactly.
+#[cfg_attr(all(target_os = "macos"), link(name = "libportaudio", kind = "dylib"))]
+#[cfg_attr(all(target_os = "linux"), link(name = "libportaudio", kind = "dylib"))]
+#[cfg_attr(
+    all(target_os = "windows", target_arch = "x86_64"),
+    link(name = "libportaudio64bit", kind = "raw-dylib")
+)]
+#[cfg_attr(
+    all(target_os = "windows", target_arch = "aarch64"),
+    link(name = "libportaudioarm64", kind = "raw-dylib")
+)]
+#[cfg_attr(
+    all(target_os = "windows", target_arch = "x86"),
+    link(name = "libportaudio32bit", kind = "raw-dylib")
+)]
 extern "C" {
     pub fn Pa_GetVersion() -> i32;
     pub fn Pa_GetVersionText() -> *const std::ffi::c_char;
