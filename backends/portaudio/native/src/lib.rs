@@ -90,10 +90,12 @@ pub use device::{
 pub use stream::{
     open_stream,
     start_stream,
+    set_stream_finished_callback,
     stop_stream,
     abort_stream,
     close_stream,
     is_stream_active,
+    is_stream_stopped,
     get_stream_info,
     get_stream_time,
     get_stream_cpu_load,

@@ -38,22 +38,25 @@ export interface NativeAddon {
   getVersionText(): string;
 
   // 流
-  openStream(params: {
-    device: number;
-    channels: number;
-    sampleFormat: number;
-    sampleRate: number;
-    latency: number;
-    blockSize: number;
-    flags: number;
-    isInput: boolean;
-    isOutput: boolean;
-  }): void;
+  openStream(
+    device: number,
+    channels: number,
+    sampleFormat: number,
+    sampleRate: number,
+    latency: number,
+    blockSize: number,
+    flags: number,
+    isInput: boolean,
+    isOutput: boolean,
+    hasCallback: boolean,
+  ): number;
   startStream(handle: number): void;
+  setStreamFinishedCallback(handle: number): void;
   stopStream(handle: number): void;
   abortStream(handle: number): void;
   closeStream(handle: number): void;
   isStreamActive(handle: number): boolean;
+  isStreamStopped(handle: number): boolean;
   getStreamInfo(handle: number): { inputLatency: number; outputLatency: number; sampleRate: number };
   getStreamTime(handle: number): number;
   getStreamCpuLoad(handle: number): number;

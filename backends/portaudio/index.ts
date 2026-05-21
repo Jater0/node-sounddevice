@@ -186,7 +186,7 @@ class PortAudioDeviceManager implements IDeviceManager {
 
 class PortAudioStream implements IAudioStream {
   private _native: NativeAddon;
-  private _handle: number = -1; // Phase 2b: stream handle ID
+  private _handle: number;
   private _sampleRate: number;
   private _blockSize: number;
   private _channels: number | [number, number];
@@ -195,10 +195,8 @@ class PortAudioStream implements IAudioStream {
   private _latency: number | [number, number];
   private _device: number | string | [number | string, number | string];
   private _kind: StreamKind;
-  private _callback: StreamCallback | null;
-  private _finishedCallback: StreamFinishedCallback | null;
+  private _fmtPa: number;
   private _closed: boolean = false;
-  private _started: boolean = false;
 
   constructor(
     native: NativeAddon,
@@ -211,22 +209,14 @@ class PortAudioStream implements IAudioStream {
     latency: number | [number, number],
     flags: number,
     callback: StreamCallback | null,
-    finishedCallback: StreamFinishedCallback | null,
+    _finishedCallback: StreamFinishedCallback | null,
   ) {
     this._native = native;
     this._kind = kind;
-    this._sampleRate = sampleRate;
-    this._blockSize = blockSize;
-    this._channels = channels;
-    this._dtype = dtype as SampleFormat | [SampleFormat, SampleFormat];
-    this._latency = latency;
-    this._device = device;
-    this._callback = callback;
-    this._finishedCallback = finishedCallback;
 
     const fmt = Array.isArray(dtype) ? dtype[0]! : dtype;
-    const fmtPa = sampleFormatToPa(fmt, native);
-    const sampleSize = native.getSampleSize(fmtPa);
+    this._fmtPa = sampleFormatToPa(fmt, native);
+    const sampleSize = native.getSampleSize(this._fmtPa);
     if (kind === 'duplex') {
       this._sampleSize = [sampleSize, sampleSize];
     } else {
@@ -239,11 +229,39 @@ class PortAudioStream implements IAudioStream {
     const isInput = kind === 'input' || kind === 'duplex';
     const isOutput = kind === 'output' || kind === 'duplex';
 
-    // Phase 2b: 实际打开流并保存 handle
-    // native.openStream({ device: dev, channels: ch, sampleFormat: fmtPa,
-    //   sampleRate, latency: lat, blockSize, flags, isInput, isOutput });
-    //
-    // 当前：占位 — 流操作抛出 "not yet implemented"
+    // Open the actual PortAudio stream
+    this._handle = native.openStream(
+      dev,
+      ch,
+      this._fmtPa,
+      sampleRate,
+      lat,
+      blockSize,
+      flags,
+      isInput,
+      isOutput,
+      callback != null, // hasCallback
+    );
+
+    // Get actual stream info
+    let info: { inputLatency: number; outputLatency: number; sampleRate: number };
+    try {
+      info = native.getStreamInfo(this._handle);
+    } catch {
+      info = { inputLatency: lat, outputLatency: lat, sampleRate };
+    }
+
+    this._sampleRate = info.sampleRate;
+    this._blockSize = blockSize;
+    this._channels = channels;
+    this._dtype = dtype as SampleFormat | [SampleFormat, SampleFormat];
+    this._device = device;
+
+    if (kind === 'duplex') {
+      this._latency = [info.inputLatency, info.outputLatency];
+    } else {
+      this._latency = kind === 'input' ? info.inputLatency : info.outputLatency;
+    }
   }
 
   get sampleRate(): number { return this._sampleRate; }
@@ -253,60 +271,132 @@ class PortAudioStream implements IAudioStream {
   get sampleSize(): number | [number, number] { return this._sampleSize; }
   get latency(): number | [number, number] { return this._latency; }
   get device(): number | string | [number | string, number | string] { return this._device; }
+
   get active(): boolean {
     if (this._closed) return false;
-    // Phase 2b: return this._native.isStreamActive(this._handle);
-    return false;
+    try { return this._native.isStreamActive(this._handle); } catch { return false; }
   }
+
   get stopped(): boolean {
     if (this._closed) return true;
-    // Phase 2b: return !this._native.isStreamActive(this._handle);
-    return true;
+    try { return this._native.isStreamStopped(this._handle); } catch { return true; }
   }
+
   get closed(): boolean { return this._closed; }
+
   get time(): number {
-    // Phase 2b: return this._native.getStreamTime(this._handle);
-    return 0;
+    if (this._closed) return 0;
+    try { return this._native.getStreamTime(this._handle); } catch { return 0; }
   }
+
   get cpuLoad(): number {
-    // Phase 2b: return this._native.getStreamCpuLoad(this._handle);
-    return 0;
+    if (this._closed) return 0;
+    try { return this._native.getStreamCpuLoad(this._handle); } catch { return 0; }
   }
 
   start(): void {
     if (this._closed) throw new AudioError('Stream is closed');
-    // Phase 2b: this._native.startStream(this._handle);
-    this._started = true;
+    this._native.startStream(this._handle);
   }
 
   stop(): void {
     if (this._closed) return;
-    // Phase 2b: this._native.stopStream(this._handle);
-    this._started = false;
+    this._native.stopStream(this._handle);
   }
 
   abort(): void {
     if (this._closed) return;
-    // Phase 2b: this._native.abortStream(this._handle);
-    this._started = false;
+    this._native.abortStream(this._handle);
   }
 
   close(): void {
     if (this._closed) return;
-    // Phase 2b: this._native.closeStream(this._handle);
+    this._native.closeStream(this._handle);
     this._closed = true;
-    this._started = false;
   }
 
-  get readAvailable(): number { return 0; }
-  get writeAvailable(): number { return 0; }
-
-  read(_frames: number): Float32Array {
-    throw new AudioError('Blocking read: Phase 2b — stream handle management not yet implemented');
+  get readAvailable(): number {
+    if (this._closed) return 0;
+    try { return this._native.getReadAvailable(this._handle); } catch { return 0; }
   }
 
-  write(_buffer: Float32Array): void {
-    throw new AudioError('Blocking write: Phase 2b — stream handle management not yet implemented');
+  get writeAvailable(): number {
+    if (this._closed) return 0;
+    try { return this._native.getWriteAvailable(this._handle); } catch { return 0; }
+  }
+
+  read(frames: number): Float32Array {
+    if (this._closed) throw new AudioError('Stream is closed');
+    if (this._kind === 'output') throw new AudioError('Cannot read from an output-only stream');
+
+    const raw = this._native.readStream(this._handle, frames);
+    const channels = Array.isArray(this._channels) ? this._channels[0]! : this._channels;
+
+    // Convert raw bytes to Float32Array based on sample format
+    if (this._fmtPa === this._native.PA_FLOAT32) {
+      return new Float32Array(raw.buffer, raw.byteOffset, raw.byteLength / 4);
+    } else if (this._fmtPa === this._native.PA_INT16) {
+      const out = new Float32Array(frames * channels);
+      for (let i = 0; i < out.length; i++) {
+        out[i] = raw.readInt16LE(i * 2) / 32768;
+      }
+      return out;
+    } else if (this._fmtPa === this._native.PA_INT32) {
+      const out = new Float32Array(frames * channels);
+      for (let i = 0; i < out.length; i++) {
+        out[i] = raw.readInt32LE(i * 4) / 2147483648;
+      }
+      return out;
+    } else if (this._fmtPa === this._native.PA_INT8) {
+      const out = new Float32Array(frames * channels);
+      for (let i = 0; i < out.length; i++) {
+        out[i] = raw.readInt8(i) / 128;
+      }
+      return out;
+    } else if (this._fmtPa === this._native.PA_UINT8) {
+      const out = new Float32Array(frames * channels);
+      for (let i = 0; i < out.length; i++) {
+        out[i] = (raw.readUInt8(i) - 128) / 128;
+      }
+      return out;
+    }
+
+    throw new AudioError(`Unsupported sample format for read: ${this._fmtPa}`);
+  }
+
+  write(buffer: Float32Array): void {
+    if (this._closed) throw new AudioError('Stream is closed');
+    if (this._kind === 'input') throw new AudioError('Cannot write to an input-only stream');
+
+    // Convert Float32Array to raw bytes based on sample format
+    let raw: Buffer;
+    if (this._fmtPa === this._native.PA_FLOAT32) {
+      raw = Buffer.from(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+    } else if (this._fmtPa === this._native.PA_INT16) {
+      raw = Buffer.alloc(buffer.length * 2);
+      for (let i = 0; i < buffer.length; i++) {
+        raw.writeInt16LE(Math.round(Math.max(-1, Math.min(1, buffer[i]!)) * 32767), i * 2);
+      }
+    } else if (this._fmtPa === this._native.PA_INT32) {
+      raw = Buffer.alloc(buffer.length * 4);
+      for (let i = 0; i < buffer.length; i++) {
+        raw.writeInt32LE(Math.round(Math.max(-1, Math.min(1, buffer[i]!)) * 2147483647), i * 4);
+      }
+    } else if (this._fmtPa === this._native.PA_INT8) {
+      raw = Buffer.alloc(buffer.length);
+      for (let i = 0; i < buffer.length; i++) {
+        raw.writeInt8(Math.round(Math.max(-1, Math.min(1, buffer[i]!)) * 127), i);
+      }
+    } else if (this._fmtPa === this._native.PA_UINT8) {
+      raw = Buffer.alloc(buffer.length);
+      for (let i = 0; i < buffer.length; i++) {
+        raw.writeUInt8(Math.round((Math.max(-1, Math.min(1, buffer[i]!)) + 1) * 127.5), i);
+      }
+    } else {
+      throw new AudioError(`Unsupported sample format for write: ${this._fmtPa}`);
+    }
+
+    this._native.writeStream(this._handle, raw);
   }
 }
 

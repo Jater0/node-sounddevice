@@ -349,11 +349,12 @@ src/interfaces.ts      ←  IAudioStream, IDeviceManager, IBackend
 ## Roadmap
 
 - [x] Phase 1: Core types, interfaces, errors, defaults
-- [x] Phase 2a: PortAudio backend — Rust FFI + device enumeration (skeleton)
+- [x] Phase 2a: PortAudio backend — Rust FFI + device enumeration
+- [x] Phase 2b: Stream lifecycle — blocking read/write + stream control
 - [x] Phase 3: Web Audio backend (AudioWorklet)
 - [x] Phase 4: Convenience functions + examples
 - [x] Phase 5: Tests + CI
-- [ ] Phase 2b: Complete stream lifecycle (ThreadsafeFunction callbacks, blocking read/write)
+- [ ] Phase 2c: Callback mode (ThreadsafeFunction bridge to JS)
 - [ ] Phase 6: npm package publishing with prebuild binaries
 - [ ] Phase 7: ASIO host-API specific settings
 
