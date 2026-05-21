@@ -37,3 +37,9 @@ __pycache__/
 .venv/
 venv/
 uv.lock
+backends/portaudio/native/*.dll
+backends/portaudio/native/*.lib
+backends/portaudio/native/*.pdb
+backends/portaudio/native/*.so
+backends/portaudio/native/*.dylib
+backends/portaudio/native/portaudio-binaries/portaudio.*

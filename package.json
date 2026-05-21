@@ -3,7 +3,15 @@
   "version": "0.1.0",
   "description": "Play and Record Sound with Node.js / Electron / Browser — TypeScript port of python-sounddevice",
   "license": "MIT",
-  "keywords": ["sound", "audio", "PortAudio", "play", "record", "web-audio", "electron"],
+  "keywords": [
+    "sound",
+    "audio",
+    "PortAudio",
+    "play",
+    "record",
+    "web-audio",
+    "electron"
+  ],
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
@@ -34,11 +42,14 @@
     "test": "vitest",
     "test:node": "vitest --environment node",
     "test:web": "vitest --environment jsdom",
+    "list-devices": "tsx examples/list_devices.ts",
+    "play-sine": "tsx examples/play_sine.ts",
     "prepublishOnly": "npm run build"
   },
   "devDependencies": {
+    "@types/node": "^20.0.0",
+    "tsx": "^4.22.3",
     "typescript": "^5.4.0",
-    "vitest": "^1.6.0",
-    "@types/node": "^20.0.0"
+    "vitest": "^1.6.0"
   }
 }

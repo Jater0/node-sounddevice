@@ -1,8 +1,12 @@
-/// Raw PortAudio C FFI bindings.
-/// Mirrors the C declarations from python-sounddevice/sounddevice_build.py
+#![allow(
+    non_camel_case_types,
+    non_upper_case_globals,
+    non_snake_case,
+    dead_code
+)]
 
-#![allow(non_camel_case_types)]
-#![allow(dead_code)]
+//! Raw PortAudio C FFI bindings.
+//! Mirrors the C declarations from python-sounddevice/sounddevice_build.py
 
 use std::ffi::c_void;
 
@@ -208,6 +212,8 @@ pub type PaStreamFinishedCallback =
 
 // ─── FFI Declarations ─────────────────────────────
 
+#[cfg_attr(target_os = "windows", link(name = "portaudio", kind = "raw-dylib"))]
+#[cfg_attr(not(target_os = "windows"), link(name = "portaudio"))]
 extern "C" {
     pub fn Pa_GetVersion() -> i32;
     pub fn Pa_GetVersionText() -> *const std::ffi::c_char;

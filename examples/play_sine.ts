@@ -15,12 +15,13 @@ async function main() {
 
   // --list-devices
   if (args.includes('--list-devices') || args.includes('-l')) {
+    const backend = await getBackend();
     const devices = await getDevices();
+    const defIn = backend.devices.getDefaultInputDevice();
+    const defOut = backend.devices.getDefaultOutputDevice();
     console.log('Available audio devices:');
     devices.forEach((d, i) => {
-      const mark =
-        i === (await getBackend()).devices.getDefaultOutputDevice() ? '<' :
-        i === (await getBackend()).devices.getDefaultInputDevice() ? '>' : ' ';
+      const mark = i === defIn && i === defOut ? '*' : i === defIn ? '>' : i === defOut ? '<' : ' ';
       console.log(
         `${mark} ${String(i).padStart(2)} ${d.name}, ` +
         `(${d.maxInputChannels} in, ${d.maxOutputChannels} out)` +

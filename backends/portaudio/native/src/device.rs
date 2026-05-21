@@ -6,20 +6,27 @@ use napi_derive::napi;
 use std::ffi::CStr;
 
 use crate::ffi;
-use crate::error;
 
 /// Output type for a single device's information.
 #[napi(object)]
 pub struct JsDeviceInfo {
     pub id: u32,
     pub name: String,
+    #[napi(js_name = "hostAPI")]
     pub host_api: u32,
+    #[napi(js_name = "maxInputChannels")]
     pub max_input_channels: u32,
+    #[napi(js_name = "maxOutputChannels")]
     pub max_output_channels: u32,
+    #[napi(js_name = "defaultLowInputLatency")]
     pub default_low_input_latency: f64,
+    #[napi(js_name = "defaultLowOutputLatency")]
     pub default_low_output_latency: f64,
+    #[napi(js_name = "defaultHighInputLatency")]
     pub default_high_input_latency: f64,
+    #[napi(js_name = "defaultHighOutputLatency")]
     pub default_high_output_latency: f64,
+    #[napi(js_name = "defaultSampleRate")]
     pub default_sample_rate: f64,
 }
 
@@ -28,8 +35,11 @@ pub struct JsDeviceInfo {
 pub struct JsHostApiInfo {
     pub id: u32,
     pub name: String,
+    #[napi(js_name = "deviceCount")]
     pub device_count: u32,
+    #[napi(js_name = "defaultInputDevice")]
     pub default_input_device: i32,
+    #[napi(js_name = "defaultOutputDevice")]
     pub default_output_device: i32,
 }
 

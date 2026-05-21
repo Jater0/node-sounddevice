@@ -12,11 +12,12 @@ import { getDevices, getHostAPIs, getVersionText, getBackend } from '../src/inde
 async function main() {
   const backend = await getBackend();
   console.log(`Backend: ${backend.capabilities.name}`);
-  console.log(`Version: ${getVersionText() || 'N/A'}`);
+  const versionText = await getVersionText();
+  console.log(`Version: ${versionText || 'N/A'}`);
   console.log();
 
   const hostAPIs = await getHostAPIs();
-  const hostApiNames = hostAPIs.map(h => h.name);
+  const hostApiNames = new Map(hostAPIs.map(h => [h.id, h.name]));
 
   const devices = await getDevices();
   const defIn = backend.devices.getDefaultInputDevice();
@@ -31,7 +32,7 @@ async function main() {
       idx === defIn ? '>' :
       idx === defOut ? '<' : ' ';
 
-    const haName = hostApiNames[dev.hostAPI] ?? `HostAPI ${dev.hostAPI}`;
+    const haName = hostApiNames.get(dev.hostAPI) ?? `HostAPI ${dev.hostAPI}`;
 
     console.log(
       `${mark} ${String(idx).padStart(digits)} ${dev.name}, ` +

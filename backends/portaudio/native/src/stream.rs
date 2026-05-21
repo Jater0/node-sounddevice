@@ -7,8 +7,6 @@
 
 use napi::{Error, Result, Status};
 use napi_derive::napi;
-use std::ffi::c_void;
-use std::sync::Mutex;
 
 use crate::ffi;
 use crate::error;
@@ -73,7 +71,7 @@ impl Drop for StreamHandle {
 /// Returns a JSON-like string describing the stream handle (for now).
 /// Phase 2b: return a proper external reference.
 #[napi]
-pub fn open_stream(params: &JsStreamParams) -> Result<()> {
+pub fn open_stream(params: JsStreamParams) -> Result<()> {
     // Determine input/output parameters
     let (input_params, output_params) = if params.is_input && params.is_output {
         let inp = ffi::PaStreamParameters {
@@ -135,7 +133,8 @@ pub fn open_stream(params: &JsStreamParams) -> Result<()> {
         )
     };
 
-    error::check(err, "Error opening stream")?;
+    error::check(err, "Error opening stream")
+        .map_err(|e| Error::new(Status::GenericFailure, e))?;
 
     if stream.is_null() {
         return Err(Error::new(Status::GenericFailure, "Stream is null after open"));

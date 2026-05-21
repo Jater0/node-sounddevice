@@ -1,15 +1,15 @@
-/// node-sounddevice-native
-/// PortAudio native addon for Node.js via napi-rs.
-///
-/// Provides:
-/// - Device enumeration (get_device_count, get_device_info, ...)
-/// - Host API enumeration (get_host_api_count, get_host_api_info, ...)
-/// - Stream lifecycle (open_stream, start_stream, stop_stream, ...)
-/// - Blocking read/write (read_stream, write_stream)
-/// - PortAudio constants (sample formats, flags, error codes)
-
 #![deny(clippy::all)]
 #![allow(dead_code)]
+
+//! node-sounddevice-native
+//! PortAudio native addon for Node.js via napi-rs.
+//!
+//! Provides:
+//! - Device enumeration (get_device_count, get_device_info, ...)
+//! - Host API enumeration (get_host_api_count, get_host_api_info, ...)
+//! - Stream lifecycle (open_stream, start_stream, stop_stream, ...)
+//! - Blocking read/write (read_stream, write_stream)
+//! - PortAudio constants (sample formats, flags, error codes)
 
 #[macro_use]
 extern crate napi_derive;
