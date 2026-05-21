@@ -1,0 +1,20 @@
+# Build-time only — not needed at runtime
+src/
+examples/
+test/
+backends/portaudio/native/Cargo.toml
+backends/portaudio/native/Cargo.lock
+backends/portaudio/native/build.rs
+backends/portaudio/native/src/
+backends/portaudio/native/target/
+backends/portaudio/native/package.json
+backends/portaudio/native/copy-artifact.js
+backends/portaudio/native/portaudio-binaries/
+
+# Dev config
+tsconfig.json
+vitest.config.ts
+.github/
+
+# Scripts
+scripts/
