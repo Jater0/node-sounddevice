@@ -93,6 +93,8 @@ export interface StreamOptions {
   neverDropInput?: boolean;
   /** 用回调填充初始输出缓冲区 */
   primeOutputBuffersUsingStreamCallback?: boolean;
+  /** 平台特定设置（AsioSettings / CoreAudioSettings / WasapiSettings） */
+  extraSettings?: PlatformSettings;
 }
 
 /** 双向流的参数（输入/输出各自指定） */
@@ -133,6 +135,52 @@ export interface StreamTime {
   /** 输出 DAC 时间 */
   outputBufferDacTime: number;
 }
+
+// ─── 平台特定设置 ──────────────────────────────────
+
+/**
+ * ASIO 特定输入/输出设置。
+ * 仅 PortAudio 后端 + ASIO 驱动可用。
+ */
+export interface AsioSettings {
+  type: 'asio';
+  /** 零基通道编号列表 */
+  channelSelectors: number[];
+}
+
+/**
+ * Core Audio 特定输入/输出设置。
+ * 仅 PortAudio 后端 + macOS 可用。
+ */
+export interface CoreAudioSettings {
+  type: 'coreaudio';
+  /** 通道映射（零基，-1 = 不使用该通道） */
+  channelMap?: number[];
+  /** 允许 PortAudio 修改硬件参数 */
+  changeDeviceParameters?: boolean;
+  /** 采样率不匹配时打开失败 */
+  failIfConversionRequired?: boolean;
+  /** 采样率转换质量 */
+  conversionQuality?: 'min' | 'low' | 'medium' | 'high' | 'max';
+}
+
+/**
+ * WASAPI 特定输入/输出设置。
+ * 仅 PortAudio 后端 + Windows 可用。
+ */
+export interface WasapiSettings {
+  type: 'wasapi';
+  /** 独占模式 */
+  exclusive?: boolean;
+  /** 允许系统级转换 */
+  autoConvert?: boolean;
+  /** 强制指定样本格式 */
+  explicitSampleFormat?: boolean;
+}
+
+export type PlatformSettings = AsioSettings | CoreAudioSettings | WasapiSettings;
+
+// ─── 后端能力 ─────────────────────────────────────
 
 /** 后端能力声明 */
 export interface BackendCapabilities {

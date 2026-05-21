@@ -91,6 +91,21 @@ function getDeviceId(
   return matches[0]!.id;
 }
 
+/** Convert CoreAudio settings to PortAudio flags */
+function coreaudioFlagsToNum(s: Record<string, unknown>): number {
+  const qualityMap: Record<string, number> = {
+    min: 0x0100,
+    low: 0x0300,
+    medium: 0x0200,
+    high: 0x0400,
+    max: 0x0000,
+  };
+  let flags = qualityMap[(s.conversionQuality as string) ?? 'max'] ?? 0x0000;
+  if (s.changeDeviceParameters) flags |= 0x01;
+  if (s.failIfConversionRequired) flags |= 0x02;
+  return flags;
+}
+
 function resolveLatency(
   latency: LatencyHint,
   deviceInfo: DeviceInfo,
@@ -214,6 +229,7 @@ class PortAudioStream implements IAudioStream {
     flags: number,
     callback: StreamCallback | null,
     finishedCallback: StreamFinishedCallback | null,
+    extraSettings?: unknown,
   ) {
     this._native = native;
     this._kind = kind;
@@ -229,25 +245,40 @@ class PortAudioStream implements IAudioStream {
       this._sampleSize = sampleSize;
     }
 
-    const dev = Array.isArray(device) ? device[0]! : device;
-    const ch = Array.isArray(channels) ? channels[0]! : channels;
-    const lat = Array.isArray(latency) ? latency[0]! : latency;
+    const idev = Array.isArray(device) ? device[0]! : device;
+    const odev = Array.isArray(device) ? (kind === 'duplex' ? device[1]! : device) : device;
+    const ich = Array.isArray(channels) ? channels[0]! : (kind === 'output' ? 0 : channels);
+    const och = Array.isArray(channels) ? (kind === 'duplex' ? channels[1]! : channels[0]!) : (kind === 'input' ? 0 : channels);
+    const ilat = Array.isArray(latency) ? latency[0]! : latency;
+    const olat = Array.isArray(latency) ? (kind === 'duplex' ? latency[1]! : latency) : latency;
     const isInput = kind === 'input' || kind === 'duplex';
     const isOutput = kind === 'output' || kind === 'duplex';
+
+    // Extract platform-specific settings
+    const es = extraSettings as Record<string, unknown> | undefined;
 
     // Always open in blocking mode.
     // "Callback mode" is simulated by a JS-level polling loop.
     this._handle = native.openStream(
-      dev,
-      ch,
+      idev as number,
+      odev as number,
+      ich as number,
+      och as number,
       this._fmtPa,
       sampleRate,
-      lat,
+      ilat as number,
+      olat as number,
       blockSize,
       flags,
       isInput,
       isOutput,
       false, // no native callback — we poll from JS
+      es?.type === 'asio' ? (es as { channelSelectors: number[] }).channelSelectors ?? null : null,
+      es?.type === 'coreaudio' ? (es as { channelMap?: number[] }).channelMap ?? null : null,
+      es?.type === 'coreaudio' ? coreaudioFlagsToNum(es as Record<string, unknown>) : null,
+      es?.type === 'wasapi' ? !!(es as { exclusive?: boolean }).exclusive : null,
+      es?.type === 'wasapi' ? !!(es as { autoConvert?: boolean }).autoConvert : null,
+      es?.type === 'wasapi' ? !!(es as { explicitSampleFormat?: boolean }).explicitSampleFormat : null,
     );
 
     // Get actual stream info
@@ -255,7 +286,7 @@ class PortAudioStream implements IAudioStream {
     try {
       info = native.getStreamInfo(this._handle);
     } catch {
-      info = { inputLatency: lat, outputLatency: lat, sampleRate };
+      info = { inputLatency: ilat as number, outputLatency: olat as number, sampleRate };
     }
 
     this._sampleRate = info.sampleRate;
@@ -307,11 +338,37 @@ class PortAudioStream implements IAudioStream {
     this._native.startStream(this._handle);
     this._started = true;
 
+    // Register finished callback with PortAudio
+    if (this._finishedCallback) {
+      try {
+        this._native.setStreamFinishedCallback(this._handle);
+      } catch {
+        // setStreamFinishedCallback is a no-op in Phase 2c
+      }
+    }
+
     // If a callback is provided, start the JS-level polling loop
     if (this._callback) {
       this._polling = true;
       this._pollLoop();
+
+      // Poll for stream completion to trigger finished callback
+      if (this._finishedCallback) {
+        this._pollFinished();
+      }
     }
+  }
+
+  /** Poll for stream completion (non-blocking streams) */
+  private _pollFinished(): void {
+    if (this._closed || !this._started) return;
+    try {
+      if (this._native.isStreamStopped(this._handle) && !this._native.isStreamActive(this._handle)) {
+        this._finishedCallback?.();
+        return;
+      }
+    } catch { /* ignore */ }
+    setTimeout(() => this._pollFinished(), 100);
   }
 
   /**
@@ -456,6 +513,19 @@ class PortAudioStream implements IAudioStream {
         out[i] = (raw.readUInt8(i) - 128) / 128;
       }
       return out;
+    } else if (this._fmtPa === this._native.PA_INT24) {
+      // int24 = packed 3 bytes per sample, little-endian
+      const out = new Float32Array(frames * channels);
+      for (let i = 0; i < out.length; i++) {
+        const b0 = raw.readUInt8(i * 3)!;
+        const b1 = raw.readUInt8(i * 3 + 1)!;
+        const b2 = raw.readUInt8(i * 3 + 2)!;
+        // Sign-extend 24-bit to 32-bit
+        let val = (b0 | (b1 << 8) | (b2 << 16));
+        if (val & 0x800000) val |= 0xff000000;
+        out[i] = val / 8388608; // 2^23
+      }
+      return out;
     }
 
     throw new AudioError(`Unsupported sample format for read: ${this._fmtPa}`);
@@ -488,6 +558,15 @@ class PortAudioStream implements IAudioStream {
       raw = Buffer.alloc(buffer.length);
       for (let i = 0; i < buffer.length; i++) {
         raw.writeUInt8(Math.round((Math.max(-1, Math.min(1, buffer[i]!)) + 1) * 127.5), i);
+      }
+    } else if (this._fmtPa === this._native.PA_INT24) {
+      raw = Buffer.alloc(buffer.length * 3);
+      for (let i = 0; i < buffer.length; i++) {
+        const sample = Math.max(-1, Math.min(1, buffer[i]!));
+        const intVal = Math.round(sample * 8388607); // 2^23 - 1
+        raw.writeUInt8(intVal & 0xff, i * 3);
+        raw.writeUInt8((intVal >> 8) & 0xff, i * 3 + 1);
+        raw.writeUInt8((intVal >> 16) & 0xff, i * 3 + 2);
       }
     } else {
       throw new AudioError(`Unsupported sample format for write: ${this._fmtPa}`);
@@ -651,10 +730,15 @@ export class PortAudioBackend implements IBackend {
       options.primeOutputBuffersUsingStreamCallback ?? defaults.primeOutputBuffersUsingStreamCallback,
     );
 
+    // 平台特定设置
+    const extraSettings = (options as StreamOptions).extraSettings
+      ?? selectFromPair(defaults.extraSettings, kind === 'input' ? 'input' : 'output');
+
     return new PortAudioStream(
       n, kind, dev, channels, dtype, sampleRate,
       blockSize, latency, flags,
       callback ?? null, finishedCallback ?? null,
+      extraSettings ?? undefined,
     );
   }
 }

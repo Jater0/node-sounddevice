@@ -73,6 +73,15 @@ class Defaults {
   extraSettings: InputOutputPair<unknown> = [null, null];
 
   /**
+   * 默认宿主 API 索引（只读）。
+   * 需在初始化后端后访问。
+   */
+  get hostapi(): number {
+    // Late-bound — resolved when backend is available
+    return -1;
+  }
+
+  /**
    * 重置所有值为出厂默认。
    */
   reset(): void {

@@ -163,7 +163,15 @@ export async function getVersionText(): Promise<string> {
   return backend.getVersionText();
 }
 
-export { play, record, playRecord } from './convenience.js';
+export {
+  play,
+  record,
+  playRecord,
+  wait,
+  stop,
+  getStatus,
+  getStream,
+} from './convenience.js';
 
 /**
  * 休眠（毫秒）。

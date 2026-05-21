@@ -309,8 +309,14 @@ extern "C" {
 
     pub fn Pa_GetSampleSize(format: PaSampleFormat) -> PaError;
     pub fn Pa_Sleep(msec: i64);
+}
 
-    // Platform-specific
+// ─── Platform-specific (macOS only) ────────────────
+// Separate extern block — only linked on macOS to avoid missing symbols on Windows/Linux.
+
+#[cfg(target_os = "macos")]
+#[link(name = "portaudio", kind = "dylib")]
+extern "C" {
     pub fn PaMacCore_SetupStreamInfo(
         data: *mut PaMacCoreStreamInfo,
         flags: u64,
@@ -335,4 +341,27 @@ pub struct PaMacCoreStreamInfo {
     pub flags: u64,
     pub channelMap: *const i32,
     pub channelMapSize: u64,
+}
+
+#[repr(C)]
+pub struct PaAsioStreamInfo {
+    pub size: u64,
+    pub hostApiType: PaHostApiTypeId,
+    pub version: u64,
+    pub flags: u64,
+    pub channelSelectors: *mut i32,
+}
+
+#[repr(C)]
+pub struct PaWasapiStreamInfo {
+    pub size: u64,
+    pub hostApiType: PaHostApiTypeId,
+    pub version: u64,
+    pub flags: u64,
+    pub channelMask: u64,
+    pub hostProcessorOutput: *mut c_void,
+    pub hostProcessorInput: *mut c_void,
+    pub threadPriority: i32,
+    pub streamCategory: i32,
+    pub streamOption: i32,
 }

@@ -77,6 +77,12 @@ struct StreamHandle {
     output_channels: u32,
     sample_size: u32,
     sample_format: ffi::PaSampleFormat,
+    // Keep platform-specific structs alive
+    _asio_info: Option<Box<ffi::PaAsioStreamInfo>>,
+    _asio_selectors: Option<Vec<i32>>,
+    _coreaudio_info: Option<Box<ffi::PaMacCoreStreamInfo>>,
+    _coreaudio_map: Option<Vec<i32>>,
+    _wasapi_info: Option<Box<ffi::PaWasapiStreamInfo>>,
 }
 
 unsafe impl Send for StreamHandle {}
@@ -90,7 +96,18 @@ impl StreamHandle {
         sample_size: u32,
         sample_format: ffi::PaSampleFormat,
     ) -> Self {
-        Self { ptr, input_channels, output_channels, sample_size, sample_format }
+        Self {
+            ptr,
+            input_channels,
+            output_channels,
+            sample_size,
+            sample_format,
+            _asio_info: None,
+            _asio_selectors: None,
+            _coreaudio_info: None,
+            _coreaudio_map: None,
+            _wasapi_info: None,
+        }
     }
 }
 
@@ -152,73 +169,176 @@ unsafe extern "C" fn pa_callback(
 /// - If a callback is needed, pass `has_callback = true` (Phase 2c).
 /// - For blocking mode, pass `has_callback = false`.
 #[napi]
+#[allow(clippy::too_many_arguments)]
 pub fn open_stream(
-    device: i32,
-    channels: u32,
+    input_device: i32,
+    output_device: i32,
+    input_channels: u32,
+    output_channels: u32,
     sample_format: u32,
     sample_rate: f64,
-    latency: f64,
+    input_latency: f64,
+    output_latency: f64,
     block_size: u32,
     flags: u32,
     is_input: bool,
     is_output: bool,
     has_callback: bool,
+    // Platform-specific settings (optional)
+    asio_channel_selectors: Option<Vec<i32>>,
+    coreaudio_channel_map: Option<Vec<i32>>,
+    coreaudio_flags: Option<u32>,
+    wasapi_exclusive: Option<bool>,
+    wasapi_auto_convert: Option<bool>,
+    wasapi_explicit_sample_format: Option<bool>,
 ) -> Result<u32> {
-    // Determine input/output parameters
-    let (inp_ptr, outp_ptr, in_ch, out_ch) = if is_input && is_output {
-        let inp = ffi::PaStreamParameters {
-            device,
-            channelCount: channels as i32,
-            sampleFormat: sample_format as u64,
-            suggestedLatency: latency,
-            hostApiSpecificStreamInfo: std::ptr::null_mut(),
-        };
-        let outp = ffi::PaStreamParameters {
-            device,
-            channelCount: channels as i32,
-            sampleFormat: sample_format as u64,
-            suggestedLatency: latency,
-            hostApiSpecificStreamInfo: std::ptr::null_mut(),
-        };
-        (&inp as *const _, &outp as *const _, channels, channels)
-    } else if is_input {
-        let inp = ffi::PaStreamParameters {
-            device,
-            channelCount: channels as i32,
-            sampleFormat: sample_format as u64,
-            suggestedLatency: latency,
-            hostApiSpecificStreamInfo: std::ptr::null_mut(),
-        };
-        (&inp as *const _, std::ptr::null(), channels, 0)
-    } else {
-        let outp = ffi::PaStreamParameters {
-            device,
-            channelCount: channels as i32,
-            sampleFormat: sample_format as u64,
-            suggestedLatency: latency,
-            hostApiSpecificStreamInfo: std::ptr::null_mut(),
-        };
-        (std::ptr::null(), &outp as *const _, 0, channels)
-    };
+    let actual_in_ch = if is_input { input_channels } else { 0 };
+    let actual_out_ch = if is_output { output_channels } else { 0 };
 
-    // Get sample size
-    let sample_size = unsafe { ffi::Pa_GetSampleSize(sample_format as u64) };
-    if sample_size < 0 {
-        return Err(Error::new(
-            Status::GenericFailure,
-            format!("Invalid sample format: {}", sample_format),
-        ));
-    }
-    let sample_size = sample_size as u32;
-
-    // Allocate the stream handle BEFORE opening the stream.
-    let stream_handle = Box::new(StreamHandle::new(
+    // Allocate stream handle first (so platform structs can be stored in it)
+    let mut stream_handle = Box::new(StreamHandle::new(
         std::ptr::null_mut(),
-        in_ch,
-        out_ch,
-        sample_size,
+        actual_in_ch,
+        actual_out_ch,
+        sample_size_val(sample_format)?,
         sample_format as u64,
     ));
+
+    // ── Build platform-specific stream info ──────
+
+    let mut asio_in_info: Option<Box<ffi::PaAsioStreamInfo>> = None;
+    let mut asio_selectors: Option<Vec<i32>> = None;
+    #[allow(unused_mut)]
+    let mut ca_in_info: Option<Box<ffi::PaMacCoreStreamInfo>> = None;
+    #[allow(unused_mut)]
+    let mut ca_map: Option<Vec<i32>> = None;
+    let mut wasapi_in_info: Option<Box<ffi::PaWasapiStreamInfo>> = None;
+
+    // ASIO
+    if let Some(ref selectors) = asio_channel_selectors {
+        if !selectors.is_empty() {
+            let mut sel = selectors.clone();
+            let info = Box::new(ffi::PaAsioStreamInfo {
+                size: std::mem::size_of::<ffi::PaAsioStreamInfo>() as u64,
+                hostApiType: ffi::paASIO,
+                version: 1,
+                flags: ffi::paAsioUseChannelSelectors,
+                channelSelectors: sel.as_mut_ptr(),
+            });
+            asio_selectors = Some(sel);
+            asio_in_info = Some(info);
+        }
+    }
+
+    // CoreAudio (macOS only)
+    #[cfg(target_os = "macos")]
+    if coreaudio_channel_map.is_some() || coreaudio_flags.is_some() {
+        let mut info = Box::new(ffi::PaMacCoreStreamInfo {
+            size: std::mem::size_of::<ffi::PaMacCoreStreamInfo>() as u64,
+            hostApiType: ffi::paCoreAudio,
+            version: 1,
+            flags: coreaudio_flags.unwrap_or(ffi::paMacCoreConversionQualityMax as u32) as u64,
+            channelMap: std::ptr::null(),
+            channelMapSize: 0,
+        });
+
+        if let Some(ref map) = coreaudio_channel_map {
+            if !map.is_empty() {
+                let m = map.clone();
+                info.channelMap = m.as_ptr();
+                info.channelMapSize = m.len() as u64;
+                ca_map = Some(m);
+            }
+        }
+
+        unsafe { ffi::PaMacCore_SetupStreamInfo(&mut *info, info.flags); }
+        ca_in_info = Some(info);
+    }
+    // On non-macOS, CoreAudio settings are silently ignored
+    #[cfg(not(target_os = "macos"))]
+    let _ = (coreaudio_channel_map, coreaudio_flags);
+
+    // WASAPI
+    if wasapi_exclusive.is_some() || wasapi_auto_convert.is_some() || wasapi_explicit_sample_format.is_some() {
+        let mut wasapi_flags: u64 = 0;
+        if wasapi_exclusive.unwrap_or(false) { wasapi_flags |= ffi::paWinWasapiExclusive; }
+        if wasapi_auto_convert.unwrap_or(false) { wasapi_flags |= ffi::paWinWasapiAutoConvert; }
+        if wasapi_explicit_sample_format.unwrap_or(false) { wasapi_flags |= ffi::paWinWasapiExplicitSampleFormat; }
+
+        wasapi_in_info = Some(Box::new(ffi::PaWasapiStreamInfo {
+            size: std::mem::size_of::<ffi::PaWasapiStreamInfo>() as u64,
+            hostApiType: ffi::paWASAPI,
+            version: 1,
+            flags: wasapi_flags,
+            channelMask: 0,
+            hostProcessorOutput: std::ptr::null_mut(),
+            hostProcessorInput: std::ptr::null_mut(),
+            threadPriority: 0, // eThreadPriorityNone
+            streamCategory: 0, // eAudioCategoryOther
+            streamOption: 0,   // eStreamOptionNone
+        }));
+    }
+
+    // Determine hostApiSpecificStreamInfo pointers
+    let in_info_ptr = if is_input {
+        asio_in_info.as_ref().map(|i| &**i as *const _ as *mut std::ffi::c_void).unwrap_or_else(|| {
+            ca_in_info.as_ref().map(|i| &**i as *const _ as *mut std::ffi::c_void).unwrap_or_else(|| {
+                wasapi_in_info.as_ref().map(|i| &**i as *const _ as *mut std::ffi::c_void).unwrap_or(std::ptr::null_mut())
+            })
+        })
+    } else {
+        std::ptr::null_mut()
+    };
+
+    let out_info_ptr = if is_output {
+        asio_in_info.as_ref().map(|i| &**i as *const _ as *mut std::ffi::c_void).unwrap_or_else(|| {
+            ca_in_info.as_ref().map(|i| &**i as *const _ as *mut std::ffi::c_void).unwrap_or_else(|| {
+                wasapi_in_info.as_ref().map(|i| &**i as *const _ as *mut std::ffi::c_void).unwrap_or(std::ptr::null_mut())
+            })
+        })
+    } else {
+        std::ptr::null_mut()
+    };
+
+    // ── Build stream parameters ──────────────────
+
+    let (inp_ptr, outp_ptr) = if is_input && is_output {
+        let inp = ffi::PaStreamParameters {
+            device: input_device,
+            channelCount: input_channels as i32,
+            sampleFormat: sample_format as u64,
+            suggestedLatency: input_latency,
+            hostApiSpecificStreamInfo: in_info_ptr,
+        };
+        let outp = ffi::PaStreamParameters {
+            device: output_device,
+            channelCount: output_channels as i32,
+            sampleFormat: sample_format as u64,
+            suggestedLatency: output_latency,
+            hostApiSpecificStreamInfo: out_info_ptr,
+        };
+        (&inp as *const _, &outp as *const _)
+    } else if is_input {
+        let inp = ffi::PaStreamParameters {
+            device: input_device,
+            channelCount: input_channels as i32,
+            sampleFormat: sample_format as u64,
+            suggestedLatency: input_latency,
+            hostApiSpecificStreamInfo: in_info_ptr,
+        };
+        (&inp as *const _, std::ptr::null())
+    } else {
+        let outp = ffi::PaStreamParameters {
+            device: output_device,
+            channelCount: output_channels as i32,
+            sampleFormat: sample_format as u64,
+            suggestedLatency: output_latency,
+            hostApiSpecificStreamInfo: out_info_ptr,
+        };
+        (std::ptr::null(), &outp as *const _)
+    };
+
+    // ── Open the stream ──────────────────────────
 
     let callback: ffi::PaStreamCallback = if has_callback {
         Some(pa_callback)
@@ -252,11 +372,24 @@ pub fn open_stream(
         return Err(Error::new(Status::GenericFailure, "Stream is null after open"));
     }
 
-    let mut handle = stream_handle;
-    handle.ptr = stream;
+    // Store platform structs in handle to keep them alive
+    stream_handle.ptr = stream;
+    stream_handle._asio_info = asio_in_info;
+    stream_handle._asio_selectors = asio_selectors;
+    stream_handle._coreaudio_info = ca_in_info;
+    stream_handle._coreaudio_map = ca_map;
+    stream_handle._wasapi_info = wasapi_in_info;
 
-    let id = register_stream(*handle);
+    let id = register_stream(*stream_handle);
     Ok(id)
+}
+
+fn sample_size_val(sample_format: u32) -> Result<u32> {
+    let s = unsafe { ffi::Pa_GetSampleSize(sample_format as u64) };
+    if s < 0 {
+        return Err(Error::new(Status::GenericFailure, format!("Invalid sample format: {}", sample_format)));
+    }
+    Ok(s as u32)
 }
 
 // ─── Stream Control ───────────────────────────────

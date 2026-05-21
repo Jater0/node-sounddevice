@@ -66,16 +66,18 @@ await play(data, sr);
 ### Device Enumeration
 
 ```ts
-import { getDevices, getHostAPIs } from 'node-sounddevice';
+import { getDevices, getHostAPIs, getVersionText } from 'node-sounddevice';
 
 const devices = await getDevices();
 // [
-//   { id: 0, name: 'Built-in Microphone', maxInputChannels: 2, maxOutputChannels: 0, ... },
-//   { id: 1, name: 'Built-in Output',     maxInputChannels: 0, maxOutputChannels: 2, ... },
+//   { id: 0, name: 'Built-in Microphone', maxInputChannels: 2, ... },
+//   { id: 1, name: 'Built-in Output',     maxOutputChannels: 2, ... },
 // ]
 
 const hostAPIs = await getHostAPIs();
-// [{ id: 0, name: 'Core Audio', deviceCount: 3, ... }]
+// [{ id: 0, name: 'MME', deviceCount: 5, ... }]
+
+console.log(await getVersionText()); // "PortAudio V19.7.0-devel, revision unknown"
 ```
 
 ### Playback
@@ -86,11 +88,14 @@ import { play } from 'node-sounddevice';
 // Blocking: wait until playback finishes
 await play(audioData, 48000, { blocking: true });
 
-// Non-blocking: return immediately, playback continues in background
+// Non-blocking: return immediately
 await play(audioData, 48000);
 
 // Loop
 await play(audioData, 48000, { loop: true, blocking: true });
+
+// Channel mapping: send mono data to channel 2
+await play(monoData, 48000, { mapping: [2] });
 
 // Specify device
 await play(audioData, 48000, { device: 'Built-in Output' });
@@ -108,15 +113,44 @@ const data = await record(3 * 48000, 48000);
 
 // With custom channels
 const stereo = await record(3 * 48000, 48000, { channels: 2 });
+
+// Channel mapping: record only channel 3
+const ch3 = await record(3 * 48000, 48000, { mapping: [3] });
+
+// Record into existing array
+const buf = new Float32Array(48000 * 2);
+await record(48000, 48000, { out: buf, blocking: true });
 ```
 
-### Simultaneous Playback & Recording (Full-Duplex)
+### Control Functions
+
+```ts
+import { wait, stop, getStatus, getStream } from 'node-sounddevice';
+
+// Wait for non-blocking play/rec to finish
+await play(audioData, 48000);  // non-blocking
+const flags = wait();          // wait + get status flags
+
+// Stop current playback/recording
+stop();
+
+// Get status of last operation
+const status = getStatus();    // CallbackFlags
+
+// Get underlying stream reference
+const stream = getStream();
+console.log(stream.cpuLoad);
+```
+
+### Playback + Recording (Full-Duplex)
 
 ```ts
 import { playRecord } from 'node-sounddevice';
 
 const recorded = await playRecord(playbackData, 48000, {
   inputChannels: 1,
+  inputMapping: [1],       // record from channel 1
+  outputMapping: [1, 2],   // play to channels 1 and 2
   frames: 48000,
 });
 ```
@@ -128,16 +162,16 @@ import { getBackend } from 'node-sounddevice';
 
 const backend = await getBackend();
 
-// Callback mode — real-time, low latency
+// Callback mode — setImmediate polling loop, low latency
 const stream = backend.openStream(
   'output',
   { sampleRate: 48000, channels: 1 },
   (indata, outdata, frames, time, status) => {
-    // Fill outdata with audio samples
     for (let i = 0; i < frames; i++) {
-      outdata[i] = Math.sin(2 * Math.PI * 440 * i / 48000);
+      outdata![i] = Math.sin(2 * Math.PI * 440 * i / 48000);
     }
   },
+  () => console.log('Stream finished'), // finished callback
 );
 
 stream.start();
@@ -145,7 +179,7 @@ stream.start();
 stream.stop();
 stream.close();
 
-// Blocking mode — simpler, for non-real-time use
+// Blocking mode — simpler, for file playback/recording
 const stream2 = backend.openStream('input', { sampleRate: 48000, channels: 2 });
 stream2.start();
 
@@ -154,6 +188,17 @@ console.log(block.length); // 2048 (frames × channels)
 
 stream2.stop();
 stream2.close();
+
+// Duplex with separate input/output devices
+const duplex = backend.openStream(
+  'duplex',
+  {
+    device: [micDeviceId, speakerDeviceId], // different devices
+    channels: [2, 2],
+    sampleRate: 48000,
+  },
+  callback,
+);
 ```
 
 ### Global Defaults
@@ -180,28 +225,46 @@ function callback(indata, outdata, frames, time, status) {
 }
 ```
 
+### Platform-Specific Settings
+
+```ts
+import { AsioSettings, CoreAudioSettings, WasapiSettings } from 'node-sounddevice';
+import { defaults } from 'node-sounddevice';
+
+// ASIO — select specific channels (Windows, ASIO driver required)
+const asioOut = { type: 'asio', channelSelectors: [12, 13] } as AsioSettings;
+await play(audioData, 48000, { extraSettings: asioOut });
+
+// Core Audio — channel map (macOS only)
+const caIn = { type: 'coreaudio', channelMap: [1, 3] } as CoreAudioSettings;
+const caOut = { type: 'coreaudio', channelMap: [-1, -1, 0, -1, 1, -1] } as CoreAudioSettings;
+
+// WASAPI — exclusive mode (Windows only)
+const wasapi = { type: 'wasapi', exclusive: true } as WasapiSettings;
+defaults.extraSettings = wasapi;
+```
+
 ---
 
-## Platform-Specific Features
+## Platform Features
 
 ### PortAudio Backend (Node.js / Electron)
 
-- All PortAudio sample formats: `float32`, `int32`, `int24`, `int16`, `int8`, `uint8`
+- All sample formats: `float32`, `int32`, `int24`, `int16`, `int8`, `uint8`
 - CPU load monitoring (`stream.cpuLoad`)
-- Host-API specific settings (CoreAudio, WASAPI, ASIO — Phase 2b)
-- Real-time priority callbacks
+- Platform-specific settings: `AsioSettings`, `CoreAudioSettings`, `WasapiSettings`
+- Duplex streams with separate input/output devices
+- Both callback and blocking modes
 
 ### Web Audio Backend (Browser)
 
-- Auto-detected when running in a browser
-- Uses `AudioWorklet` for low-latency processing
-- Falls back to `ScriptProcessorNode` on older browsers
+- Auto-detected in browsers
+- `AudioWorklet` for low-latency (fallback: `ScriptProcessorNode`)
 - Requires user gesture to start `AudioContext`
 - Blocking read/write not supported (callback mode only)
-- `int24` format not available
+- `int24` and platform settings not available
 
 ```ts
-// Explicit backend selection (optional)
 import { WebBackend } from 'node-sounddevice/web';
 import { setBackend } from 'node-sounddevice';
 
@@ -221,61 +284,25 @@ setBackend(new WebBackend());
 ### Steps
 
 ```bash
-# 1. Clone
 git clone <repo>
 cd node-sounddevice
-
-# 2. Install JS dependencies
 npm install
-
-# 3. Build TypeScript
-npm run build
-
-# 4. Build native addon (Rust → .node)
-cd backends/portaudio/native
-npm run build
-cd ../../..
-
-# 5. Run tests
-npm test
-
-# 6. Try examples
-npx ts-node examples/list_devices.ts
-npx ts-node examples/play_sine.ts 440
+npm run build:native    # Compile Rust → .node
+npm run build           # Compile TypeScript → dist/
+npm test                # 21 tests
+npx tsx examples/list_devices.ts
+npx tsx examples/play_sine.ts 440
 ```
 
 ### Build Scripts
 
 | Script | Description |
 |---|---|
-| `npm run build` | Compile TypeScript → `dist/` |
-| `npm run build:native` | Compile Rust addon (alias for `cd backends/portaudio/native && npm run build`) |
-| `npm test` | Run unit tests (vitest) |
-| `npm run test:web` | Run tests with jsdom (browser simulation) |
-
-### Native Build Details
-
-The Rust addon lives in `backends/portaudio/native/`:
-
-```
-backends/portaudio/native/
-├── Cargo.toml              # napi-rs project
-├── build.rs                # Links PortAudio
-├── portaudio-binaries/     # Prebuilt .dylib / .dll
-│   ├── libportaudio.dylib          # macOS universal
-│   ├── libportaudio64bit.dll       # Windows x64
-│   ├── libportaudioarm64.dll       # Windows arm64
-│   └── ...                        # 32-bit + ASIO variants
-└── src/
-    ├── lib.rs               # N-API entry point
-    ├── ffi.rs               # PortAudio C bindings
-    ├── device.rs            # Device enumeration
-    ├── stream.rs            # Stream lifecycle
-    └── error.rs             # Error mapping
-```
-
-On macOS and Windows, PortAudio is linked from the bundled binaries.  
-On Linux, PortAudio is linked from the system library (`pkg-config portaudio-2.0`).
+| `npm run build` | tsc + copy .node/DLLs to dist/ |
+| `npm run build:native` | cargo build + copy-artifact.js |
+| `npm test` | Unit tests (vitest) |
+| `npm run list-devices` | Run list_devices example |
+| `npm run play-sine` | Run play_sine example |
 
 ---
 
@@ -288,13 +315,11 @@ On Linux, PortAudio is linked from the system library (`pkg-config portaudio-2.0
 | `examples/play_file.ts` | Play a WAV file |
 | `examples/record.ts` | Record to a WAV file |
 
-Run with:
-
 ```bash
-npx ts-node examples/list_devices.ts
-npx ts-node examples/play_sine.ts 440 --amplitude 0.3
-npx ts-node examples/play_file.ts music.wav
-npx ts-node examples/record.ts 5 recording.wav
+npx tsx examples/list_devices.ts
+npx tsx examples/play_sine.ts 440 --amplitude 0.3
+npx tsx examples/play_file.ts music.wav
+npx tsx examples/record.ts 5 recording.wav
 ```
 
 ---
@@ -302,24 +327,20 @@ npx ts-node examples/record.ts 5 recording.wav
 ## Electron Usage
 
 ```ts
-// Main process — direct access to PortAudio backend
+// Main process — direct PortAudio access
 import { getDevices, play } from 'node-sounddevice';
 
-// Renderer process — expose via preload
+// Renderer — via preload
 // preload.ts
-import { contextBridge, ipcRenderer } from 'electron';
 contextBridge.exposeInMainWorld('sounddevice', {
   getDevices: () => ipcRenderer.invoke('sounddevice:getDevices'),
-  play: (data, sr) => ipcRenderer.invoke('sounddevice:play', data, sr),
 });
 
 // main.ts
-ipcMain.handle('sounddevice:getDevices', async () => {
-  return getDevices();
-});
+ipcMain.handle('sounddevice:getDevices', () => getDevices());
 ```
 
-> **Note:** Audio callbacks run in a real-time thread. For low-latency use cases, keep stream processing in the main process or a Worker thread. IPC adds latency.
+> Audio callbacks run in a real-time thread. Keep stream processing in the main process or a Worker. IPC adds latency.
 
 ---
 
@@ -329,7 +350,7 @@ ipcMain.handle('sounddevice:getDevices', async () => {
 User Code
     ↓
 src/index.ts           ←  auto-detects backend
-src/convenience.ts     ←  play(), record(), playRecord()
+src/convenience.ts     ←  play(), record(), playRecord(), wait(), stop(), ...
 src/defaults.ts        ←  global settings
 src/interfaces.ts      ←  IAudioStream, IDeviceManager, IBackend
     ↓
@@ -349,20 +370,18 @@ src/interfaces.ts      ←  IAudioStream, IDeviceManager, IBackend
 ## Roadmap
 
 - [x] Phase 1: Core types, interfaces, errors, defaults
-- [x] Phase 2a: PortAudio backend — Rust FFI + device enumeration
-- [x] Phase 2b: Stream lifecycle — blocking read/write + stream control
-- [x] Phase 2c: Callback mode (JS-level polling loop via setImmediate)
+- [x] Phase 2: PortAudio backend — Rust FFI, device enum, stream lifecycle, callbacks
 - [x] Phase 3: Web Audio backend (AudioWorklet)
 - [x] Phase 4: Convenience functions + examples
 - [x] Phase 5: Tests + CI
-- [ ] Phase 6: npm package publishing with prebuild binaries
-- [ ] Phase 7: ASIO host-API specific settings
+- [x] Phase 7: Platform settings — `AsioSettings`, `CoreAudioSettings`, `WasapiSettings`
+- [ ] Phase 6: npm publish with prebuild binaries
 
 ---
 
 ## License
 
-MIT — see [python-sounddevice](https://github.com/spatialaudio/python-sounddevice/) for the original Python implementation.
+MIT — original Python: [python-sounddevice](https://github.com/spatialaudio/python-sounddevice/)
 
-PortAudio binaries are from [PortAudio](http://www.portaudio.com/) (MIT License).  
-ASIO SDK is © Steinberg Media Technologies GmbH.
+PortAudio binaries from [PortAudio](http://www.portaudio.com/) (MIT).  
+ASIO SDK © Steinberg Media Technologies GmbH.

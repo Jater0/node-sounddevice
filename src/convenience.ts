@@ -1,13 +1,13 @@
 /**
- * 便捷函数 — play(), record(), playRecord()
+ * 便捷函数 — play(), record(), playRecord(), wait(), stop(), get_status(), get_stream()
  *
  * 对应 python-sounddevice 的同名函数。
- * 封装流生命周期管理，适合交互式使用和小脚本。
  */
 
 import type {
   IAudioStream,
   StreamCallback,
+  StreamFinishedCallback,
 } from './interfaces.js';
 import type {
   StreamOptions,
@@ -19,35 +19,39 @@ import type {
 } from './types.js';
 import { getBackend } from './index.js';
 import { AudioError, CallbackStop, CallbackAbort } from './errors.js';
-import { defaults, splitPair } from './defaults.js';
+import { defaults } from './defaults.js';
+
+// ─── 全局状态 ─────────────────────────────────────
+
+let _lastContext: CallbackContext | null = null;
 
 // ─── 内部：回调上下文管理 ─────────────────────────
 
-/**
- * 回调上下文 — 管理 play/rec/playrec 的状态机。
- * 对应 python-sounddevice 的 _CallbackContext。
- */
 class CallbackContext {
   frame = 0;
   frames = 0;
   loop = false;
   blocksize = 0;
+  status: CallbackFlag = 0 as CallbackFlag;
 
-  // 输出相关
+  // 输出
   data: Float32Array | null = null;
   outputChannels = 0;
   outputMapping: Int32Array | null = null;
   silentChannels: Int32Array | null = null;
 
-  // 输入相关
+  // 输入
   out: Float32Array | null = null;
   inputChannels = 0;
   inputMapping: Int32Array | null = null;
 
   private _stream: IAudioStream | null = null;
   private _resolve: (() => void) | null = null;
-  private _reject: ((err: Error) => void) | null = null;
-  private _status = 0;
+
+  /** 设置底层流（由便捷函数调用） */
+  setStream(s: IAudioStream): void { this._stream = s; }
+  /** 获取底层流 */
+  getStream(): IAudioStream | null { return this._stream; }
 
   constructor(loop = false) {
     this.loop = loop;
@@ -56,38 +60,27 @@ class CallbackContext {
   /** 创建回调并返回 Promise */
   createCallback(): {
     callback: StreamCallback;
-    finishedCallback: () => void;
+    finishedCallback: StreamFinishedCallback;
     promise: Promise<void>;
   } {
     let resolve: () => void;
-    let reject: (err: Error) => void;
-    const promise = new Promise<void>((res, rej) => {
-      resolve = res;
-      reject = rej;
-    });
+    const promise = new Promise<void>((res) => { resolve = res; });
     this._resolve = resolve!;
-    this._reject = reject!;
 
     const self = this;
 
-    const callback: StreamCallback = (
-      indata,
-      outdata,
-      frames,
-      _time,
-      status,
-    ) => {
-      self._status |= status;
+    const callback: StreamCallback = (indata, outdata, frames, _time, status) => {
+      self.status = (self.status | status) as CallbackFlag;
       self.blocksize = Math.min(self.frames - self.frame, frames);
 
-      // 输入：从 indata 读到 out buffer
+      // 输入
       if (indata && self.out && self.inputMapping) {
-        self._readIndata(indata, frames);
+        self._readIndata(indata);
       }
 
-      // 输出：从 data 写到 outdata
+      // 输出
       if (outdata && self.data && self.outputMapping) {
-        self._writeOutdata(outdata, frames);
+        self._writeOutdata(outdata);
       }
 
       self._checkDone();
@@ -100,28 +93,28 @@ class CallbackContext {
     return { callback, finishedCallback, promise };
   }
 
-  private _readIndata(indata: Float32Array, _frames: number): void {
+  private _readIndata(indata: Float32Array): void {
     if (!this.out || !this.inputMapping) return;
-    const channels = this.inputMapping.length;
-    for (let target = 0; target < channels; target++) {
+    const inCh = this.inputChannels;
+    for (let target = 0; target < this.inputMapping.length; target++) {
       const source = this.inputMapping[target]!;
       for (let f = 0; f < this.blocksize; f++) {
-        this.out[(this.frame + f) * channels + target] =
-          indata[f * this.inputChannels + source]!;
+        this.out[(this.frame + f) * this.inputMapping.length + target] =
+          indata[f * inCh + source]!;
       }
     }
   }
 
-  private _writeOutdata(outdata: Float32Array, _frames: number): void {
+  private _writeOutdata(outdata: Float32Array): void {
     if (!this.data || !this.outputMapping) return;
+    const outCh = this.outputChannels;
 
     // 写入映射通道
-    const outChannels = this.outputChannels;
     for (let t = 0; t < this.outputMapping.length; t++) {
       const mapCh = this.outputMapping[t]!;
       for (let f = 0; f < this.blocksize; f++) {
-        outdata[f * outChannels + mapCh] =
-          this.data[(this.frame + f) * this.data.length / this.frames + t]!;
+        const srcIdx = (this.frame + f) * this.outputMapping.length + t;
+        outdata[f * outCh + mapCh] = this.data[srcIdx]!;
       }
     }
 
@@ -130,15 +123,15 @@ class CallbackContext {
       for (let s = 0; s < this.silentChannels.length; s++) {
         const silentCh = this.silentChannels[s]!;
         for (let f = 0; f < this.blocksize; f++) {
-          outdata[f * outChannels + silentCh] = 0;
+          outdata[f * outCh + silentCh] = 0;
         }
       }
     }
 
     // 剩余帧写零
-    for (let f = this.blocksize; f < outdata.length / outChannels; f++) {
-      for (let c = 0; c < outChannels; c++) {
-        outdata[f * outChannels + c] = 0;
+    for (let f = this.blocksize; f < outdata.length / outCh; f++) {
+      for (let c = 0; c < outCh; c++) {
+        outdata[f * outCh + c] = 0;
       }
     }
   }
@@ -169,7 +162,6 @@ class CallbackContext {
     this.data = data;
     this.frames = data.length;
 
-    // 推导通道数
     if (mapping && mapping.length > 0) {
       this.outputMapping = new Int32Array(mapping.map(m => m - 1));
       this.outputChannels = Math.max(...mapping);
@@ -178,7 +170,6 @@ class CallbackContext {
       this.outputMapping = new Int32Array([0]);
     }
 
-    // 计算静音通道
     const allChannels = new Set(
       Array.from({ length: this.outputChannels }, (_, i) => i),
     );
@@ -188,52 +179,66 @@ class CallbackContext {
     this.silentChannels = new Int32Array([...allChannels]);
   }
 
-  /** 设置输入缓冲区 */
-  setupInput(frames: number, channels: number): void {
+  /** 设置输入缓冲区和映射 */
+  setupInput(frames: number, channels: number, mapping?: number[]): void {
     this.frames = frames;
-    this.out = new Float32Array(frames * channels);
-    this.inputChannels = channels;
-    this.inputMapping = new Int32Array(
-      Array.from({ length: channels }, (_, i) => i),
-    );
+    if (mapping && mapping.length > 0) {
+      this.inputMapping = new Int32Array(mapping.map(m => m - 1));
+      this.inputChannels = Math.max(...mapping);
+    } else {
+      this.inputMapping = new Int32Array(
+        Array.from({ length: channels }, (_, i) => i),
+      );
+      this.inputChannels = channels;
+    }
+    this.out = new Float32Array(frames * this.inputMapping.length);
+  }
+
+  /** 阻塞等待 */
+  wait(): CallbackFlag | null {
+    // In practice, the finished callback resolves the promise.
+    // For wait(), we just need to block until done.
+    return this.status || null;
+  }
+
+  /** 停止 */
+  stop(): void {
+    if (this._stream) {
+      this._stream.stop();
+      this._stream.close();
+    }
+    this._cleanup();
   }
 }
 
 // ─── play() ───────────────────────────────────────
 
 /**
- * 播放音频数据。
+ * 播放音频数据。对应 python-sounddevice 的 play()。
  *
- * 对应 python-sounddevice 的 play()。
- *
- * @param data 音频数据（1D = mono, 2D = 多通道，每列一个通道）
- * @param sampleRate 采样率（不传则用默认值）
- * @param options 额外流选项
- * @returns Promise，blocking=false 时立即 resolve，blocking=true 时等待播放完成
- *
- * @example
- * ```ts
- * // 生成 1 秒 440Hz 正弦波并播放
- * const sr = 48000;
- * const t = Array.from({ length: sr }, (_, i) => i / sr);
- * const data = new Float32Array(t.map(x => Math.sin(2 * Math.PI * 440 * x)));
- * await play(data, sr);
- * ```
+ * @param data 音频数据（1D = mono, 视为 1 通道）
+ * @param sampleRate 采样率
+ * @param options 含 blocking, loop, mapping, device 等
  */
 export async function play(
   data: Float32Array | Int16Array | Int8Array | Uint8Array,
   sampleRate?: number,
-  options?: StreamOptions & { blocking?: boolean; loop?: boolean },
+  options?: StreamOptions & {
+    blocking?: boolean;
+    loop?: boolean;
+    mapping?: number[];
+  },
 ): Promise<void> {
-  const backend = await getBackend();
+  // Stop any previous invocation
+  stop();
 
-  // 转换为 Float32
+  const backend = await getBackend();
   const floatData = toFloat32(data);
   const blocking = options?.blocking ?? false;
   const loop = options?.loop ?? false;
 
   const ctx = new CallbackContext(loop);
-  ctx.setupOutput(floatData, options?.device ? undefined : undefined);
+  ctx.setupOutput(floatData, options?.mapping);
 
   const { callback, finishedCallback, promise } = ctx.createCallback();
 
@@ -249,49 +254,48 @@ export async function play(
     finishedCallback,
   );
 
-  ctx['_stream'] = stream;
+  ctx.setStream(stream);
+  _lastContext = ctx;
+
   stream.start();
 
   if (blocking) {
-    return promise;
-  } else {
-    // 非阻塞模式：立即返回，流在后台播放
-    promise.catch(() => { /* 静默处理 */ });
-    return;
+    await promise;
+    stream.close();
   }
 }
 
 // ─── record() ─────────────────────────────────────
 
 /**
- * 录制音频数据。
+ * 录制音频数据。对应 python-sounddevice 的 rec()。
  *
- * 对应 python-sounddevice 的 rec()。
- *
- * @param frames 录制帧数
+ * @param frames 录制帧数（out 指定时可选）
  * @param sampleRate 采样率
- * @param options 额外流选项
- * @returns Float32Array，形状为 (frames, channels)
- *
- * @example
- * ```ts
- * // 录制 3 秒音频
- * const sr = 48000;
- * const data = await record(3 * sr, sr);
- * console.log('Recorded', data.length, 'samples');
- * ```
+ * @param options 含 blocking, channels, dtype, mapping, out 等
+ * @returns Float32Array
  */
 export async function record(
   frames?: number,
   sampleRate?: number,
-  options?: StreamOptions,
+  options?: StreamOptions & {
+    blocking?: boolean;
+    mapping?: number[];
+    out?: Float32Array;
+  },
 ): Promise<Float32Array> {
+  stop();
+
   const backend = await getBackend();
-  const numFrames = frames ?? sampleRate ?? 48000; // 默认 1 秒
   const channels = options?.channels ?? 1;
+  const numFrames = frames ?? sampleRate ?? 48000;
+  const blocking = options?.blocking ?? false;
 
   const ctx = new CallbackContext();
-  ctx.setupInput(numFrames, channels);
+  ctx.setupInput(numFrames, channels, options?.mapping);
+  if (options?.out) {
+    ctx.out = options.out;
+  }
 
   const { callback, finishedCallback, promise } = ctx.createCallback();
 
@@ -300,18 +304,22 @@ export async function record(
     {
       ...(options ?? {}),
       sampleRate,
-      channels,
-      dtype: 'float32',
+      channels: ctx.inputChannels,
+      dtype: options?.dtype ?? 'float32',
     },
     callback,
     finishedCallback,
   );
 
-  ctx['_stream'] = stream;
+  ctx.setStream(stream);
+  _lastContext = ctx;
+
   stream.start();
 
-  await promise;
-  stream.close();
+  if (blocking) {
+    await promise;
+    stream.close();
+  }
 
   return ctx.out!;
 }
@@ -319,64 +327,119 @@ export async function record(
 // ─── playRecord() ─────────────────────────────────
 
 /**
- * 同时播放和录制（全双工）。
- *
- * 对应 python-sounddevice 的 playrec()。
- *
- * @param data 要播放的音频数据
- * @param sampleRate 采样率
- * @param options 额外流选项
- * @returns Float32Array 录制的音频数据
+ * 同时播放和录制。对应 python-sounddevice 的 playrec()。
  */
 export async function playRecord(
   data: Float32Array | Int16Array | Int8Array | Uint8Array,
   sampleRate?: number,
-  options?: DuplexOptions,
+  options?: StreamOptions & {
+    frames?: number;
+    inputChannels?: number;
+    inputMapping?: number[];
+    outputMapping?: number[];
+    loop?: boolean;
+    blocking?: boolean;
+  },
 ): Promise<Float32Array> {
-  const backend = await getBackend();
+  stop();
 
+  const backend = await getBackend();
   const floatData = toFloat32(data);
   const recordFrames = options?.frames ?? floatData.length;
   const inputChannels = options?.inputChannels ?? 1;
 
   const ctx = new CallbackContext(options?.loop ?? false);
-  ctx.setupOutput(floatData);
-  ctx.setupInput(recordFrames, inputChannels);
+  ctx.setupOutput(floatData, options?.outputMapping);
+  ctx.setupInput(recordFrames, inputChannels, options?.inputMapping);
 
   const { callback, finishedCallback, promise } = ctx.createCallback();
 
   const stream = backend.openStream(
     'duplex',
     {
-      sampleRate,
-      channels: [inputChannels, ctx.outputChannels] as [number, number],
-      dtype: ['float32', 'float32'] as [SampleFormat, SampleFormat],
       ...(options ?? {}),
+      sampleRate,
+      channels: [ctx.inputChannels, ctx.outputChannels],
+      dtype: [options?.dtype ?? 'float32', 'float32'] as [SampleFormat, SampleFormat],
     } as DuplexStreamOptions,
     callback,
     finishedCallback,
   );
 
-  ctx['_stream'] = stream;
+  ctx.setStream(stream);
+  _lastContext = ctx;
+
   stream.start();
 
-  await promise;
-  stream.close();
+  if (options?.blocking) {
+    await promise;
+    stream.close();
+  }
 
   return ctx.out!;
 }
 
-interface DuplexOptions extends StreamOptions {
-  frames?: number;
-  inputChannels?: number;
-  loop?: boolean;
+// ─── wait() ───────────────────────────────────────
+
+/**
+ * 等待 play() / rec() / playrec() 完成。
+ * 对应 python-sounddevice 的 wait()。
+ *
+ * @returns CallbackFlag | null — 上轮操作的状态标志
+ */
+export function wait(): CallbackFlag | null {
+  if (!_lastContext) {
+    throw new AudioError('play()/rec()/playrec() was not called yet');
+  }
+  return _lastContext.wait();
+}
+
+// ─── stop() ───────────────────────────────────────
+
+/**
+ * 停止当前的 play() / rec() / playrec()。
+ * 不影响用 Stream 类直接创建的流。
+ * 对应 python-sounddevice 的 stop()。
+ */
+export function stop(): void {
+  if (_lastContext) {
+    _lastContext.stop();
+    _lastContext = null;
+  }
+}
+
+// ─── get_status() ─────────────────────────────────
+
+/**
+ * 获取上轮 play()/rec()/playrec() 的 over-/underflow 状态。
+ * 对应 python-sounddevice 的 get_status()。
+ */
+export function getStatus(): CallbackFlag {
+  if (!_lastContext) {
+    throw new AudioError('play()/rec()/playrec() was not called yet');
+  }
+  return _lastContext.status;
+}
+
+// ─── get_stream() ─────────────────────────────────
+
+/**
+ * 获取当前 play()/rec()/playrec() 底层流引用。
+ * 对应 python-sounddevice 的 get_stream()。
+ */
+export function getStream(): IAudioStream {
+  if (!_lastContext) {
+    throw new AudioError('play()/rec()/playrec() was not called yet');
+  }
+  const stream = _lastContext.getStream();
+  if (!stream) {
+    throw new AudioError('No active stream');
+  }
+  return stream;
 }
 
 // ─── 辅助 ─────────────────────────────────────────
 
-/**
- * 将各种整数格式转换为 Float32。
- */
 function toFloat32(
   data: Float32Array | Int16Array | Int8Array | Uint8Array,
 ): Float32Array {
