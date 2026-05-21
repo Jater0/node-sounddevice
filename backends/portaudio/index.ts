@@ -25,7 +25,7 @@ import type {
   StreamInfo,
   StreamTime,
 } from '../../src/types.js';
-import { AudioError } from '../../src/errors.js';
+import { AudioError, CallbackStop, CallbackAbort } from '../../src/errors.js';
 import { defaults, splitPair, selectFromPair } from '../../src/defaults.js';
 import {
   loadNative,
@@ -197,6 +197,10 @@ class PortAudioStream implements IAudioStream {
   private _kind: StreamKind;
   private _fmtPa: number;
   private _closed: boolean = false;
+  private _callback: StreamCallback | null;
+  private _finishedCallback: StreamFinishedCallback | null;
+  private _polling: boolean = false;
+  private _started: boolean = false;
 
   constructor(
     native: NativeAddon,
@@ -209,10 +213,12 @@ class PortAudioStream implements IAudioStream {
     latency: number | [number, number],
     flags: number,
     callback: StreamCallback | null,
-    _finishedCallback: StreamFinishedCallback | null,
+    finishedCallback: StreamFinishedCallback | null,
   ) {
     this._native = native;
     this._kind = kind;
+    this._callback = callback;
+    this._finishedCallback = finishedCallback;
 
     const fmt = Array.isArray(dtype) ? dtype[0]! : dtype;
     this._fmtPa = sampleFormatToPa(fmt, native);
@@ -229,7 +235,8 @@ class PortAudioStream implements IAudioStream {
     const isInput = kind === 'input' || kind === 'duplex';
     const isOutput = kind === 'output' || kind === 'duplex';
 
-    // Open the actual PortAudio stream
+    // Always open in blocking mode.
+    // "Callback mode" is simulated by a JS-level polling loop.
     this._handle = native.openStream(
       dev,
       ch,
@@ -240,7 +247,7 @@ class PortAudioStream implements IAudioStream {
       flags,
       isInput,
       isOutput,
-      callback != null, // hasCallback
+      false, // no native callback — we poll from JS
     );
 
     // Get actual stream info
@@ -296,21 +303,111 @@ class PortAudioStream implements IAudioStream {
 
   start(): void {
     if (this._closed) throw new AudioError('Stream is closed');
+    if (this._started) return;
     this._native.startStream(this._handle);
+    this._started = true;
+
+    // If a callback is provided, start the JS-level polling loop
+    if (this._callback) {
+      this._polling = true;
+      this._pollLoop();
+    }
+  }
+
+  /**
+   * JS-level polling loop that simulates PortAudio's callback mode.
+   * Uses setImmediate to yield between iterations, keeping the event loop alive.
+   */
+  private _pollLoop(): void {
+    if (!this._polling || this._closed) return;
+    if (!this._callback) return;
+
+    const ch = Array.isArray(this._channels) ? this._channels[0]! : this._channels;
+    const blockSize = this._blockSize || 256;
+    const isInput = this._kind === 'input' || this._kind === 'duplex';
+    const isOutput = this._kind === 'output' || this._kind === 'duplex';
+    const outCh = isOutput ? (Array.isArray(this._channels) ? this._channels[1]! : this._channels) : 0;
+
+    try {
+      // Determine how many frames to process this iteration
+      let frames = blockSize;
+      if (isInput && this.readAvailable < frames) frames = this.readAvailable;
+      if (isOutput && this.writeAvailable < frames) frames = this.writeAvailable;
+      if (frames <= 0) {
+        // Not enough data available yet — try again soon
+        setImmediate(() => this._pollLoop());
+        return;
+      }
+
+      // Read input if needed
+      let indata: Float32Array | null = null;
+      if (isInput) {
+        indata = this.read(frames);
+      }
+
+      // Prepare output buffer if needed
+      let outdata: Float32Array | null = null;
+      if (isOutput) {
+        outdata = new Float32Array(frames * outCh);
+      }
+
+      // Build time info (approximate)
+      const now = this.time;
+      const streamTime: StreamTime = {
+        inputBufferAdcTime: now,
+        currentTime: now,
+        outputBufferDacTime: now + frames / this._sampleRate,
+      };
+
+      // Call the user callback
+      this._callback(indata, outdata, frames, streamTime, 0 as CallbackFlag);
+
+      // Write output if needed
+      if (isOutput && outdata) {
+        this.write(outdata);
+      }
+    } catch (err) {
+      if (err instanceof CallbackStop) {
+        this._polling = false;
+        this._finishedCallback?.();
+        this.stop();
+        return;
+      }
+      if (err instanceof CallbackAbort) {
+        this._polling = false;
+        this._finishedCallback?.();
+        this.abort();
+        return;
+      }
+      // Unknown error — stop polling and rethrow
+      this._polling = false;
+      throw err;
+    }
+
+    // Schedule next poll
+    if (this._polling) {
+      setImmediate(() => this._pollLoop());
+    }
   }
 
   stop(): void {
     if (this._closed) return;
+    this._polling = false;
+    this._started = false;
     this._native.stopStream(this._handle);
   }
 
   abort(): void {
     if (this._closed) return;
+    this._polling = false;
+    this._started = false;
     this._native.abortStream(this._handle);
   }
 
   close(): void {
     if (this._closed) return;
+    this._polling = false;
+    this._started = false;
     this._native.closeStream(this._handle);
     this._closed = true;
   }
