@@ -44,7 +44,7 @@
     "test:web": "vitest --environment jsdom",
     "list-devices": "tsx examples/list_devices.ts",
     "play-sine": "tsx examples/play_sine.ts",
-    "prepublishOnly": "npm run build"
+    "prepare": "npm run build:native"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
