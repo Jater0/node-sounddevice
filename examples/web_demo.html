@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>node-sounddevice — Web Demo</title>
+<style>
+  body { font-family: system-ui; max-width: 650px; margin: 40px auto; padding: 0 20px; }
+  button { margin: 5px; padding: 10px 20px; font-size: 16px; cursor: pointer; }
+  button:disabled { opacity: 0.4; cursor: default; }
+  pre { background: #f5f5f5; padding: 15px; border-radius: 5px; overflow-x: auto; }
+  #status { color: #666; margin: 10px 0; }
+  .error { color: red; }
+  .note { font-size: 12px; color: #999; }
+</style>
+</head>
+<body>
+
+<h1>🎵 node-sounddevice — Web Demo</h1>
+<p id="status">Initializing...</p>
+
+<div>
+  <button id="btnList" disabled>List Devices</button>
+  <button id="btnPlay" disabled>Play 440Hz Sine</button>
+  <button id="btnStop" disabled>Stop</button>
+</div>
+
+<pre id="output"></pre>
+<p class="note">
+  Requires <code>SharedArrayBuffer</code> — serve with COOP/COEP headers:<br>
+  <code>npx http-server . -c-1 --coop --coep</code>
+</p>
+
+<script type="module">
+// ─── Web Audio Backend (inline) ──────────────────
+
+const HEADER_SIZE = 8;
+const RING_CAPACITY_FRAMES = 8192; // ~170ms at 48kHz — enough buffer
+
+class RingBuffer {
+  constructor(channels) {
+    this.channels = channels;
+    const dataLen = RING_CAPACITY_FRAMES * channels;
+    this.sab = new SharedArrayBuffer(HEADER_SIZE + dataLen * 4);
+    // header: [writePos (i32), readPos (i32)]
+    this._wp = new Int32Array(this.sab, 0, 1);
+    this._rp = new Int32Array(this.sab, 4, 1);
+    this.data = new Float32Array(this.sab, HEADER_SIZE, dataLen);
+    this.capacity = RING_CAPACITY_FRAMES;
+  }
+  
+  /** Number of frames available to read */
+  available() {
+    const w = Atomics.load(this._wp, 0);
+    const r = Atomics.load(this._rp, 0);
+    return (w - r + this.capacity) % this.capacity;
+  }
+  
+  /** Number of frames that can be written */
+  writable() {
+    return this.capacity - this.available() - 1;
+  }
+  
+  /** Producer: write frames (non-blocking, returns frames written) */
+  produce(src, frames) {
+    const w = Atomics.load(this._wp, 0);
+    const free = this.capacity - this.available() - 1;
+    const n = Math.min(frames, free);
+    if (n <= 0) return 0;
+    const ch = this.channels;
+    for (let i = 0; i < n; i++) {
+      const wi = ((w + i) % this.capacity) * ch;
+      for (let c = 0; c < ch; c++) this.data[wi + c] = src[i * ch + c] || 0;
+    }
+    Atomics.store(this._wp, 0, (w + n) % this.capacity);
+    Atomics.notify(this._wp, 0, 1);
+    return n;
+  }
+  
+  /** Consumer: read frames (non-blocking, returns frames read) */
+  consume(dest, frames) {
+    const avail = this.available();
+    const n = Math.min(frames, avail);
+    if (n <= 0) return 0;
+    const r = Atomics.load(this._rp, 0);
+    const ch = this.channels;
+    for (let i = 0; i < n; i++) {
+      const ri = ((r + i) % this.capacity) * ch;
+      for (let c = 0; c < ch; c++) dest[i * ch + c] = this.data[ri + c] || 0;
+    }
+    Atomics.store(this._rp, 0, (r + n) % this.capacity);
+    return n;
+  }
+  
+  hasNewData() { return this.available() > 0; }
+  get frames() { return this.available(); }
+}
+
+const WORKLET_CODE = `
+const CAP = 8192;
+class SP extends AudioWorkletProcessor {
+  static get parameterDescriptors() { return []; }
+  constructor(o) {
+    super(o);
+    this._ib = null; this._ob = null;
+    this._ch = 1; this._in = false; this._out = false;
+    this.port.onmessage = (e) => {
+      if (e.data.type === 'init') {
+        this._in = e.data.isInput; this._out = e.data.isOutput;
+        this._ch = e.data.channels;
+        if (e.data.ib) this._ib = e.data.ib;
+        if (e.data.ob) this._ob = e.data.ob;
+        this.port.postMessage({ type: 'ready' });
+      }
+    };
+  }
+  process(inputs, outputs) {
+    const inp = inputs[0], out = outputs[0];
+    try {
+      // Write input to ring buffer
+      if (this._in && inp && inp[0] && this._ib) {
+        const wp = new Int32Array(this._ib, 0, 1);
+        const rp = new Int32Array(this._ib, 4, 1);
+        const dat = new Float32Array(this._ib, 8);
+        const w = Atomics.load(wp, 0);
+        const r = Atomics.load(rp, 0);
+        const avail = (w - r + CAP) % CAP;
+        const free = CAP - avail - 1;
+        const fc = Math.min(free, inp[0].length);
+        for (let f = 0; f < fc; f++) {
+          const wi = ((w + f) % CAP) * this._ch;
+          for (let c = 0; c < this._ch && c < inp.length; c++) {
+            dat[wi + c] = (inp[c] && inp[c][f]) || 0;
+          }
+        }
+        Atomics.store(wp, 0, (w + fc) % CAP);
+        Atomics.notify(wp, 0, 1);
+      }
+      // Read output from ring buffer
+      if (this._out && out && out[0] && this._ob) {
+        const wp = new Int32Array(this._ob, 0, 1);
+        const rp = new Int32Array(this._ob, 4, 1);
+        const dat = new Float32Array(this._ob, 8);
+        const w = Atomics.load(wp, 0);
+        const r = Atomics.load(rp, 0);
+        const avail = (w - r + CAP) % CAP;
+        const fc = Math.min(avail, out[0].length);
+        for (let f = 0; f < fc; f++) {
+          const ri = ((r + f) % CAP) * this._ch;
+          for (let c = 0; c < this._ch && c < out.length; c++) {
+            if (out[c]) out[c][f] = dat[ri + c] || 0;
+          }
+        }
+        Atomics.store(rp, 0, (r + fc) % CAP);
+      } else if (this._out && out) {
+        // No data — output silence
+        for (let c = 0; c < out.length; c++) if (out[c]) out[c].fill(0);
+      }
+    } catch (_) {}
+    return true;
+  }
+}
+registerProcessor('sp', SP);
+`;
+
+let workletUrl = null;
+function getWorkletUrl() {
+  if (!workletUrl) workletUrl = URL.createObjectURL(new Blob([WORKLET_CODE], { type: 'application/javascript' }));
+  return workletUrl;
+}
+
+// ─── WebAudioStream ──────────────────────────────
+
+class WebAudioStream {
+  constructor(kind, opts, callback, finishedCallback) {
+    this._kind = kind;
+    this._callback = callback;
+    this._finishedCallback = finishedCallback;
+    this._closed = false;
+    this._started = false;
+    this._polling = false;
+    this._ctx = null;
+    this._wn = null;
+    this._ms = null;
+    this._sn = null;
+    this._irb = null;
+    this._orb = null;
+    const ch = opts.channels ?? 1;
+    this._ich = kind === 'output' ? 0 : (Array.isArray(ch) ? ch[0] : ch);
+    this._och = kind === 'input' ? 0 : (Array.isArray(ch) ? (kind === 'duplex' ? ch[1] : ch[0]) : ch);
+    this._sr = opts.sampleRate ?? 48000;
+    this._bs = opts.blockSize || 128;
+  }
+
+  get sampleRate() { return this._ctx?.sampleRate ?? this._sr; }
+  get active() { return this._started && !this._closed; }
+
+  async start() {
+    if (this._closed || this._started) return;
+    this._ctx = new AudioContext({ sampleRate: this._sr });
+    if (this._ctx.state === 'suspended') await this._ctx.resume();
+    const maxCh = Math.max(this._ich, this._och);
+    if (this._och > 0) this._orb = new RingBuffer(this._och);
+    if (this._ich > 0) this._irb = new RingBuffer(this._ich);
+    try { await this._ctx.audioWorklet.addModule(getWorkletUrl()); } catch (_) {}
+    this._wn = new AudioWorkletNode(this._ctx, 'sp', {
+      numberOfInputs: this._kind === 'output' ? 0 : 1,
+      numberOfOutputs: this._kind === 'input' ? 0 : 1,
+      outputChannelCount: [maxCh],
+    });
+    this._wn.port.onmessage = (e) => {
+      if (e.data.type === 'ready' && this._callback) {
+        this._polling = true; this._pollLoop();
+      }
+    };
+    const transfer = this._irb ? [this._irb.sab] : [];
+    this._wn.port.postMessage({
+      type: 'init', isInput: this._kind !== 'output', isOutput: this._kind !== 'input',
+      channels: maxCh, blockSize: this._bs, ib: this._irb?.sab, ob: this._orb?.sab,
+    }, transfer);
+    if (this._kind !== 'output') {
+      this._ms = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: this._ich || 1 } });
+      this._sn = this._ctx.createMediaStreamSource(this._ms);
+      this._sn.connect(this._wn);
+    }
+    if (this._kind !== 'input') this._wn.connect(this._ctx.destination);
+    this._started = true;
+  }
+
+  _pollLoop() {
+    if (!this._polling || this._closed || !this._callback) return;
+    try {
+      const isIn = this._kind !== 'output', isOut = this._kind !== 'input';
+      
+      // Fill output buffer as much as possible
+      if (isOut && this._orb) {
+        const writable = this._orb.writable();
+        const blocks = Math.floor(writable / this._bs);
+        for (let b = 0; b < blocks && b < 8; b++) {
+          const outdata = new Float32Array(this._bs * this._och);
+          const now = this._ctx.currentTime;
+          this._callback(null, outdata, this._bs, {
+            inputBufferAdcTime: now, currentTime: now, 
+            outputBufferDacTime: now + this._bs / this._sr,
+          }, 0);
+          this._orb.produce(outdata, this._bs);
+        }
+      }
+      
+      // Drain input buffer
+      if (isIn && this._irb && this._irb.hasNewData()) {
+        const avail = this._irb.available();
+        const blocks = Math.floor(avail / this._bs);
+        for (let b = 0; b < blocks && b < 8; b++) {
+          const indata = new Float32Array(this._bs * this._ich);
+          this._irb.consume(indata, this._bs);
+          const now = this._ctx.currentTime;
+          this._callback(indata, null, this._bs, {
+            inputBufferAdcTime: now, currentTime: now, 
+            outputBufferDacTime: now + this._bs / this._sr,
+          }, 0);
+        }
+      }
+    } catch (err) {
+      this._polling = false;
+      if (err.name === 'CallbackStop') { this._finishedCallback?.(); this.stop(); return; }
+      if (err.name === 'CallbackAbort') { this._finishedCallback?.(); this.abort(); return; }
+      throw err;
+    }
+    if (this._polling) setTimeout(() => this._pollLoop(), 4);
+  }
+
+  stop() { this._polling = false; this._started = false; this._sn?.disconnect(); this._wn?.disconnect(); }
+  abort() { this.stop(); this._ctx?.close(); this._ctx = null; }
+  close() { this.abort(); this._ms?.getTracks().forEach(t => t.stop()); this._closed = true; }
+}
+
+// ─── UI ──────────────────────────────────────────
+
+const $ = id => document.getElementById(id);
+const status = $('status');
+const output = $('output');
+let stream = null;
+
+function log(msg) {
+  output.textContent += msg + '\n';
+  output.scrollTop = output.scrollHeight;
+}
+
+// Init
+try {
+  if (typeof SharedArrayBuffer === 'undefined') {
+    status.innerHTML = '<span class="error">SharedArrayBuffer not available. Start with COOP/COEP headers.</span>';
+  } else {
+    status.textContent = 'Ready — Web Audio backend';
+    $('btnList').disabled = false;
+    $('btnPlay').disabled = false;
+  }
+} catch (err) {
+  status.innerHTML = `<span class="error">${err.message}</span>`;
+}
+
+// List devices
+$('btnList').onclick = async () => {
+  output.textContent = '';
+  try {
+    // Request permission first to get device labels
+    try {
+      const s = await navigator.mediaDevices.getUserMedia({ audio: true });
+      s.getTracks().forEach(t => t.stop());
+    } catch { /* mic denied, still list devices */ }
+
+    const raw = await navigator.mediaDevices.enumerateDevices();
+    const devices = raw.filter(d => d.kind === 'audioinput' || d.kind === 'audiooutput');
+    log(`Found ${devices.length} audio devices:`);
+    log('─'.repeat(50));
+    for (const d of devices) {
+      log(`  [${d.deviceId.slice(0, 8)}] ${d.label || '(no label)'}  (${d.kind})`);
+    }
+  } catch (err) {
+    log(`ERROR: ${err.message}`);
+  }
+};
+
+// Play sine
+$('btnPlay').onclick = async () => {
+  if (stream) stream.close();
+  output.textContent = '';
+  log('Starting 440 Hz sine wave...');
+
+  try {
+    let phase = 0;
+    const sr = 48000;
+    stream = new WebAudioStream('output', { sampleRate: sr, channels: 1, blockSize: 256 },
+      (indata, outdata, frames) => {
+        if (!outdata) return;
+        for (let i = 0; i < frames; i++) {
+          outdata[i] = 0.2 * Math.sin(phase);
+          phase += 2 * Math.PI * 440 / sr;
+          if (phase > 2 * Math.PI) phase -= 2 * Math.PI;
+        }
+      },
+    );
+    await stream.start();
+    $('btnStop').disabled = false;
+    $('btnPlay').disabled = true;
+    log('▶ Playing... (click Stop to end)');
+  } catch (err) {
+    log(`ERROR: ${err.message}`);
+    $('btnPlay').disabled = false;
+  }
+};
+
+// Stop
+$('btnStop').onclick = () => {
+  if (stream) { stream.stop(); stream.close(); stream = null; }
+  $('btnPlay').disabled = false;
+  $('btnStop').disabled = true;
+  log('■ Stopped.');
+};
+</script>
+
+</body>
+</html>

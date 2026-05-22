@@ -299,12 +299,18 @@ npx tsx examples/play_sine.ts 440
 | `examples/play_sine.ts` | 播放正弦波（Ctrl+C 停止） |
 | `examples/play_file.ts` | 播放 WAV 文件 |
 | `examples/record.ts` | 录制到 WAV 文件 |
+| `examples/web_demo.html` | 浏览器演示 — 列设备 + 播正弦波 |
 
 ```bash
+# Node.js
 npx tsx examples/list_devices.ts
 npx tsx examples/play_sine.ts 440 --amplitude 0.3
 npx tsx examples/play_file.ts music.wav
 npx tsx examples/record.ts 5 recording.wav
+
+# 浏览器演示
+npm run serve-web
+# 打开 http://localhost:8080/examples/web_demo.html
 ```
 
 ---

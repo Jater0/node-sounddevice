@@ -1,18 +1,23 @@
 /**
  * Web Audio 后端 — 浏览器
  *
- * 基于 Web Audio API 实现：
- * - 设备枚举：navigator.mediaDevices.enumerateDevices()
- * - 输入流：MediaStreamSource + AudioWorklet
- * - 输出流：AudioWorklet → AudioContext.destination
- * - 双工流：MediaStreamSource → AudioWorklet → destination
+ * 基于 Web Audio API + SharedArrayBuffer + AudioWorklet 实现。
  *
- * 限制（vs PortAudio 后端）：
- * - 不支持 int24 格式
- * - 不支持平台特定设置（Asio/CoreAudio/Wasapi）
- * - 无法获取 cpuLoad
- * - 延迟比原生高
- * - 无法阻塞 read/write（只能用回调模式）
+ * 数据回路：
+ * - 输出流：主线程 (rAF 轮询) 填充 ring buffer → worklet process() 读出
+ * - 输入流：worklet process() 写入 ring buffer → 主线程 (rAF 轮询) 读出
+ * - 双工流：两个独立 ring buffer
+ *
+ * SharedArrayBuffer 结构（每个方向一块，blockSize 帧 × channels × 4 bytes）：
+ *   [0..3]     sequence: Int32 — 生产者的写入序号
+ *   [4..7]     consumed: Int32 — 消费者的读取序号
+ *   [8..]      data: Float32Array — 音频数据
+ *
+ * 限制：
+ * - 需要 SharedArrayBuffer（需 COOP/COEP 头 或 同源）
+ * - 不支持 int24
+ * - 不支持阻塞 read/write
+ * - 不支持平台特定设置
  */
 
 import type {
@@ -33,206 +38,199 @@ import type {
   StreamTime,
   CallbackFlag,
 } from '../../src/types.js';
-import { AudioError } from '../../src/errors.js';
+import { AudioError, CallbackStop, CallbackAbort } from '../../src/errors.js';
 
-// ─── 常量 ─────────────────────────────────────────
+// ─── SharedArrayBuffer Ring Buffer ────────────────
 
-/** AudioWorklet 块大小（帧数） */
-const WORKLET_BLOCK_SIZE = 128;
+const HEADER_SIZE = 8; // writePos (4) + readPos (4)
+const RING_CAPACITY_FRAMES = 8192; // ~170ms at 48kHz
 
-/** Web Audio 后端默认采样率 */
-const WEB_DEFAULT_SAMPLE_RATE = 48000;
+class RingBuffer {
+  readonly sab: SharedArrayBuffer;
+  readonly data: Float32Array;
+  readonly channels: number;
+  readonly capacity: number;
+  private _wp: Int32Array;
+  private _rp: Int32Array;
+
+  constructor(channels: number) {
+    this.channels = channels;
+    this.capacity = RING_CAPACITY_FRAMES;
+    const dataLen = this.capacity * channels;
+    this.sab = new SharedArrayBuffer(HEADER_SIZE + dataLen * 4);
+    this._wp = new Int32Array(this.sab, 0, 1);
+    this._rp = new Int32Array(this.sab, 4, 1);
+    this.data = new Float32Array(this.sab, HEADER_SIZE, dataLen);
+  }
+
+  available(): number {
+    const w = Atomics.load(this._wp, 0);
+    const r = Atomics.load(this._rp, 0);
+    return (w - r + this.capacity) % this.capacity;
+  }
+
+  writable(): number {
+    return this.capacity - this.available() - 1;
+  }
+
+  produce(src: Float32Array, frames: number): number {
+    const w = Atomics.load(this._wp, 0);
+    const free = this.capacity - this.available() - 1;
+    const n = Math.min(frames, free);
+    if (n <= 0) return 0;
+    const ch = this.channels;
+    for (let i = 0; i < n; i++) {
+      const wi = ((w + i) % this.capacity) * ch;
+      for (let c = 0; c < ch; c++) this.data[wi + c] = src[i * ch + c]!;
+    }
+    Atomics.store(this._wp, 0, (w + n) % this.capacity);
+    Atomics.notify(this._wp, 0, 1);
+    return n;
+  }
+
+  consume(dest: Float32Array, frames: number): number {
+    const avail = this.available();
+    const n = Math.min(frames, avail);
+    if (n <= 0) return 0;
+    const r = Atomics.load(this._rp, 0);
+    const ch = this.channels;
+    for (let i = 0; i < n; i++) {
+      const ri = ((r + i) % this.capacity) * ch;
+      for (let c = 0; c < ch; c++) dest[i * ch + c] = this.data[ri + c]!;
+    }
+    Atomics.store(this._rp, 0, (r + n) % this.capacity);
+    return n;
+  }
+
+  hasNewData(): boolean { return this.available() > 0; }
+}
 
 // ─── WebDeviceManager ─────────────────────────────
 
 class WebDeviceManager implements IDeviceManager {
   private _cachedDevices: DeviceInfo[] | null = null;
-  private _refreshPromise: Promise<DeviceInfo[]> | null = null;
 
-  /**
-   * 异步枚举设备（浏览器 API 是异步的）。
-   * 应在用户手势后调用以获取完整标签。
-   */
   async refreshDevices(): Promise<DeviceInfo[]> {
-    if (this._refreshPromise) return this._refreshPromise;
-
-    this._refreshPromise = this._enumerate();
-    try {
-      this._cachedDevices = await this._refreshPromise;
-      return this._cachedDevices;
-    } finally {
-      this._refreshPromise = null;
-    }
+    this._cachedDevices = await this._enumerate();
+    return this._cachedDevices;
   }
 
   private async _enumerate(): Promise<DeviceInfo[]> {
-    if (!globalThis.navigator?.mediaDevices?.enumerateDevices) {
-      return [];
-    }
+    if (!globalThis.navigator?.mediaDevices?.enumerateDevices) return [];
 
-    // 先请求权限以获取设备标签
     try {
-      const stream = await globalThis.navigator.mediaDevices.getUserMedia({
-        audio: true,
-      });
-      // 立即释放流 — 我们只需要权限来获取标签
+      const stream = await globalThis.navigator.mediaDevices.getUserMedia({ audio: true });
       stream.getTracks().forEach(t => t.stop());
-    } catch {
-      // 用户拒绝或没有麦克风，仍然可以枚举设备（无标签）
-    }
+    } catch { /* no mic permission, still enumerate */ }
 
     const rawDevices = await globalThis.navigator.mediaDevices.enumerateDevices();
     const result: DeviceInfo[] = [];
     let idCounter = 0;
 
     for (const d of rawDevices) {
-      const isInput = d.kind === 'audioinput';
-      const isOutput = d.kind === 'audiooutput';
-      if (!isInput && !isOutput) continue;
-
+      if (d.kind !== 'audioinput' && d.kind !== 'audiooutput') continue;
       result.push({
         id: d.deviceId,
         name: d.label || `Audio Device ${idCounter + 1}`,
         hostAPI: 0,
-        maxInputChannels: isInput ? 2 : 0,
-        maxOutputChannels: isOutput ? 2 : 0,
+        maxInputChannels: d.kind === 'audioinput' ? 2 : 0,
+        maxOutputChannels: d.kind === 'audiooutput' ? 2 : 0,
         defaultLowInputLatency: 0.01,
         defaultLowOutputLatency: 0.01,
         defaultHighInputLatency: 0.05,
         defaultHighOutputLatency: 0.05,
-        defaultSampleRate: WEB_DEFAULT_SAMPLE_RATE,
+        defaultSampleRate: 48000,
       });
       idCounter++;
     }
     return result;
   }
 
-  getDevices(): DeviceInfo[] {
-    return this._cachedDevices ?? [];
-  }
-
+  getDevices(): DeviceInfo[] { return this._cachedDevices ?? []; }
   getHostAPIs(): HostAPIInfo[] {
-    return [
-      {
-        id: 0,
-        name: 'Web Audio',
-        deviceCount: this.getDevices().length,
-        defaultInputDevice: -1,
-        defaultOutputDevice: -1,
-      },
-    ];
+    return [{ id: 0, name: 'Web Audio', deviceCount: this.getDevices().length, defaultInputDevice: -1, defaultOutputDevice: -1 }];
   }
-
   getDefaultInputDevice(): number { return -1; }
   getDefaultOutputDevice(): number { return -1; }
-
-  getDeviceId(_nameOrId: number | string, _kind?: 'input' | 'output'): number {
-    return -1;
-  }
-
+  getDeviceId(): number { return -1; }
   checkInputSettings(): boolean { return true; }
   checkOutputSettings(): boolean { return true; }
 }
 
-// ─── AudioWorklet 处理器代码（作为字符串内联） ────
+// ─── AudioWorklet Processor Code ──────────────────
 
-/**
- * AudioWorkletProcessor 代码。
- * 在 worklet 线程中运行，不能访问主线程作用域。
- * 以字符串形式内联，在注册时传递给 audioWorklet.addModule()。
- */
-const WORKLET_PROCESSOR_CODE = `
+const WORKLET_CODE = `
+const CAP = 8192;
 class SoundDeviceProcessor extends AudioWorkletProcessor {
-  static get parameterDescriptors() {
-    return [];
-  }
+  static get parameterDescriptors() { return []; }
 
-  constructor(options) {
-    super(options);
-    this._blocksSinceMessage = 0;
-
-    // 从主线程接收配置
+  constructor(opts) {
+    super(opts);
+    this._ib = null; this._ob = null;
+    this._ch = 1; this._in = false; this._out = false;
     this.port.onmessage = (e) => {
-      const msg = e.data;
-      if (msg.type === 'setChannelCount') {
-        // 动态调整通道数（通过 port 通信）
+      if (e.data.type === 'init') {
+        this._in = e.data.isInput; this._out = e.data.isOutput;
+        this._ch = e.data.channels;
+        if (e.data.ib) this._ib = e.data.ib;
+        if (e.data.ob) this._ob = e.data.ob;
+        this.port.postMessage({ type: 'ready' });
       }
     };
   }
 
-  process(inputs, outputs, _parameters) {
-    // inputs[0] = 输入通道数组 [channel][frames]
-    // outputs[0] = 输出通道数组 [channel][frames]
-    const input = inputs[0];
-    const output = outputs[0];
-
-    if (!input || !output) return true;
-
-    const channelCount = Math.max(
-      input.length || 1,
-      output.length || 1
-    );
-    const frameCount = output[0] ? output[0].length : 128;
-
-    // 构建 Float32Array 视图
-    // 输入数据（交错格式）
-    const inData = new Float32Array(frameCount * channelCount);
-    for (let ch = 0; ch < channelCount && ch < input.length; ch++) {
-      const src = input[ch];
-      if (src) {
-        for (let f = 0; f < frameCount; f++) {
-          inData[f * channelCount + ch] = src[f] || 0;
+  process(inputs, outputs) {
+    const inp = inputs[0], out = outputs[0];
+    try {
+      // Write input to ring buffer
+      if (this._in && inp && inp[0] && this._ib) {
+        const wp = new Int32Array(this._ib, 0, 1);
+        const rp = new Int32Array(this._ib, 4, 1);
+        const dat = new Float32Array(this._ib, 8);
+        const w = Atomics.load(wp, 0);
+        const r = Atomics.load(rp, 0);
+        const avail = (w - r + CAP) % CAP;
+        const free = CAP - avail - 1;
+        const fc = Math.min(free, inp[0].length);
+        for (let f = 0; f < fc; f++) {
+          const wi = ((w + f) % CAP) * this._ch;
+          for (let c = 0; c < this._ch && c < inp.length; c++) {
+            dat[wi + c] = (inp[c] && inp[c][f]) || 0;
+          }
         }
+        Atomics.store(wp, 0, (w + fc) % CAP);
       }
-    }
-
-    // 输出缓冲区（交错格式，预填充零）
-    const outData = new Float32Array(frameCount * channelCount);
-
-    // 发送到主线程处理（通过 MessagePort）
-    // 主线程在 'message' 事件中调用用户回调并返回结果
-    this.port.postMessage(
-      {
-        type: 'process',
-        inData: inData.buffer,
-        frameCount: frameCount,
-      },
-      [inData.buffer]  // 转移所有权，避免复制
-    );
-
-    // 注意：这种模式有延迟 — 每次 process() 都要往返主线程。
-    // 真正的 AudioWorklet 实现应该将用户 DSP 代码放在 worklet 内部。
-    // 此实现用于兼容 python-sounddevice 的回调模式。
-
-    // 等待主线程返回（同步等待在 worklet 中不可能 — 我们暂时写零）
-    for (let ch = 0; ch < channelCount && ch < output.length; ch++) {
-      const dest = output[ch];
-      if (dest) dest.fill(0);
-    }
-
-    // 定期通知主线程我们还在运行
-    this._blocksSinceMessage++;
-    if (this._blocksSinceMessage > 100) {
-      this.port.postMessage({ type: 'heartbeat' });
-      this._blocksSinceMessage = 0;
-    }
-
-    return true; // 保持处理器存活
+      // Read output from ring buffer
+      if (this._out && out && out[0] && this._ob) {
+        const wp = new Int32Array(this._ob, 0, 1);
+        const rp = new Int32Array(this._ob, 4, 1);
+        const dat = new Float32Array(this._ob, 8);
+        const w = Atomics.load(wp, 0);
+        const r = Atomics.load(rp, 0);
+        const avail = (w - r + CAP) % CAP;
+        const fc = Math.min(avail, out[0].length);
+        for (let f = 0; f < fc; f++) {
+          const ri = ((r + f) % CAP) * this._ch;
+          for (let c = 0; c < this._ch && c < out.length; c++) {
+            if (out[c]) out[c][f] = dat[ri + c] || 0;
+          }
+        }
+        Atomics.store(rp, 0, (r + fc) % CAP);
+      } else if (this._out && out) {
+        for (let c = 0; c < out.length; c++) if (out[c]) out[c].fill(0);
+      }
+    } catch (_) {}
+    return true;
   }
 }
 
 registerProcessor('sounddevice-processor', SoundDeviceProcessor);
 `;
 
-/** 内联的 worklet 代码转为 Blob URL */
 let _workletBlobUrl: string | null = null;
-
 function getWorkletUrl(): string {
   if (!_workletBlobUrl) {
-    const blob = new Blob([WORKLET_PROCESSOR_CODE], {
-      type: 'application/javascript',
-    });
-    _workletBlobUrl = URL.createObjectURL(blob);
+    _workletBlobUrl = URL.createObjectURL(new Blob([WORKLET_CODE], { type: 'application/javascript' }));
   }
   return _workletBlobUrl;
 }
@@ -245,11 +243,21 @@ class WebAudioStream implements IAudioStream {
   private _mediaStream: MediaStream | null = null;
   private _sourceNode: MediaStreamAudioSourceNode | null = null;
   private _kind: StreamKind;
-  private _options: StreamOptions | DuplexStreamOptions;
+  private _opts: StreamOptions | DuplexStreamOptions;
   private _callback: StreamCallback | null;
   private _finishedCallback: StreamFinishedCallback | null;
-  private _closed: boolean = false;
-  private _started: boolean = false;
+  private _closed = false;
+  private _started = false;
+  private _polling = false;
+
+  // SharedArrayBuffer ring buffers
+  private _inputRb: RingBuffer | null = null;
+  private _outputRb: RingBuffer | null = null;
+  private _sampleRate: number;
+  private _blockSize: number;
+  private _channels: number | [number, number];
+  private _inputChannels: number;
+  private _outputChannels: number;
 
   constructor(
     kind: StreamKind,
@@ -258,192 +266,180 @@ class WebAudioStream implements IAudioStream {
     finishedCallback: StreamFinishedCallback | null,
   ) {
     this._kind = kind;
-    this._options = options;
+    this._opts = options;
     this._callback = callback;
     this._finishedCallback = finishedCallback;
-  }
 
-  get sampleRate(): number {
-    return this._ctx?.sampleRate
-      ?? (this._options as StreamOptions).sampleRate
-      ?? WEB_DEFAULT_SAMPLE_RATE;
-  }
-
-  get blockSize(): number {
-    return (this._options as StreamOptions).blockSize || WORKLET_BLOCK_SIZE;
-  }
-
-  get channels(): number | [number, number] {
-    const ch = (this._options as StreamOptions).channels;
-    if (this._kind === 'duplex') {
+    const ch = (options as StreamOptions).channels ?? 1;
+    if (kind === 'duplex') {
       const [ich, och] = Array.isArray(ch) ? ch : [ch, ch];
-      return [ich ?? 1, och ?? 1];
+      this._inputChannels = ich;
+      this._outputChannels = och;
+      this._channels = [ich, och];
+    } else {
+      this._inputChannels = kind === 'input' ? ch : 0;
+      this._outputChannels = kind === 'output' ? ch : 0;
+      this._channels = ch;
     }
-    return ch ?? 1;
+
+    this._sampleRate = (options as StreamOptions).sampleRate ?? 48000;
+    this._blockSize = (options as StreamOptions).blockSize || 128;
   }
 
-  get dtype(): SampleFormat | [SampleFormat, SampleFormat] {
-    if (this._kind === 'duplex') {
-      const dt = (this._options as DuplexStreamOptions).dtype;
-      const [id, od] = Array.isArray(dt) ? dt : [dt, dt];
-      return [id ?? 'float32', od ?? 'float32'];
-    }
-    return (this._options as StreamOptions).dtype ?? 'float32';
-  }
-
-  get sampleSize(): number | [number, number] {
-    const s = 4; // Web Audio 始终 float32 = 4 bytes
-    return this._kind === 'duplex' ? [s, s] : s;
-  }
-
+  get sampleRate(): number { return this._ctx?.sampleRate ?? this._sampleRate; }
+  get blockSize(): number { return this._blockSize; }
+  get channels(): number | [number, number] { return this._channels; }
+  get dtype(): SampleFormat | [SampleFormat, SampleFormat] { return 'float32'; }
+  get sampleSize(): number | [number, number] { return 4; }
   get latency(): number | [number, number] {
-    const baseLatency = this._ctx?.baseLatency ?? 0.005;
-    const outputLatency = this._ctx?.outputLatency ?? 0;
-    const total = baseLatency + outputLatency;
-    return this._kind === 'duplex' ? [total, total] : total;
+    const base = (this._ctx?.baseLatency ?? 0.005) + (this._ctx?.outputLatency ?? 0);
+    return this._kind === 'duplex' ? [base, base] : base;
   }
-
-  get device(): number | string | [number | string, number | string] {
-    if (this._kind === 'duplex') return ['default', 'default'];
-    return 'default';
-  }
-
-  get active(): boolean {
-    return this._started && !this._closed;
-  }
-
-  get stopped(): boolean {
-    return !this._started || this._closed;
-  }
-
-  get closed(): boolean {
-    return this._closed;
-  }
-
-  get time(): number {
-    return this._ctx?.currentTime ?? 0;
-  }
-
-  get cpuLoad(): number {
-    return 0; // Web Audio 无法获取
-  }
+  get device(): number | string | [number | string, number | string] { return 'default'; }
+  get active(): boolean { return this._started && !this._closed; }
+  get stopped(): boolean { return !this._started || this._closed; }
+  get closed(): boolean { return this._closed; }
+  get time(): number { return this._ctx?.currentTime ?? 0; }
+  get cpuLoad(): number { return 0; }
 
   async start(): Promise<void> {
     if (this._closed) throw new AudioError('Stream is closed');
     if (this._started) return;
 
-    // 创建 AudioContext（需要用户手势后调用）
-    if (!this._ctx) {
-      this._ctx = new AudioContext({
-        sampleRate: (this._options as StreamOptions).sampleRate,
-      });
+    this._ctx = new AudioContext({ sampleRate: this._sampleRate });
+    if (this._ctx.state === 'suspended') await this._ctx.resume();
+
+    // Create SharedArrayBuffer ring buffers
+    const maxCh = Math.max(this._inputChannels, this._outputChannels);
+    if (this._outputChannels > 0) {
+      this._outputRb = new RingBuffer(this._outputChannels);
+    }
+    if (this._inputChannels > 0) {
+      this._inputRb = new RingBuffer(this._inputChannels);
     }
 
-    if (this._ctx.state === 'suspended') {
-      await this._ctx.resume();
-    }
+    // Register worklet
+    try { await this._ctx.audioWorklet.addModule(getWorkletUrl()); } catch { /* already registered */ }
 
-    // 注册 AudioWorklet 处理器
-    try {
-      await this._ctx.audioWorklet.addModule(getWorkletUrl());
-    } catch {
-      // 可能已经注册过
-    }
+    // Create worklet node
+    this._workletNode = new AudioWorkletNode(this._ctx, 'sounddevice-processor', {
+      numberOfInputs: this._kind === 'output' ? 0 : 1,
+      numberOfOutputs: this._kind === 'input' ? 0 : 1,
+      outputChannelCount: [maxCh],
+    });
 
-    const channelCount = Array.isArray(this.channels)
-      ? Math.max(this.channels[0], this.channels[1])
-      : this.channels;
-
-    // 创建 AudioWorkletNode
-    this._workletNode = new AudioWorkletNode(
-      this._ctx,
-      'sounddevice-processor',
-      {
-        numberOfInputs: this._kind === 'output' ? 0 : 1,
-        numberOfOutputs: this._kind === 'input' ? 0 : 1,
-        outputChannelCount: [channelCount],
-      },
-    );
-
-    // 输入端：获取麦克风
-    if (this._kind === 'input' || this._kind === 'duplex') {
-      try {
-        this._mediaStream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            deviceId: (this._options as StreamOptions).device
-              ? String((this._options as StreamOptions).device)
-              : undefined,
-            channelCount: Array.isArray(this.channels)
-              ? this.channels[0]
-              : this.channels,
-          },
-        });
-        this._sourceNode = this._ctx.createMediaStreamSource(this._mediaStream);
-        this._sourceNode.connect(this._workletNode);
-      } catch (err) {
-        throw new AudioError(
-          `Failed to access microphone: ${err instanceof Error ? err.message : err}`,
-        );
-      }
-    }
-
-    // 输出端：连接到 destination
-    if (this._kind === 'output' || this._kind === 'duplex') {
-      this._workletNode.connect(this._ctx.destination);
-    }
-
-    // 处理 worklet 消息
+    // Send ring buffers to worklet
     this._workletNode.port.onmessage = (e: MessageEvent) => {
-      const msg = e.data;
-      if (msg.type === 'process' && this._callback && this._started) {
-        const inData = new Float32Array(msg.inData);
-        const outData = new Float32Array(msg.frameCount * channelCount);
-        const frames = msg.frameCount;
-
-        // 构造时间戳（Web Audio 精度有限）
-        const time: StreamTime = {
-          inputBufferAdcTime: this._ctx!.currentTime,
-          currentTime: this._ctx!.currentTime,
-          outputBufferDacTime: this._ctx!.currentTime + (frames / this.sampleRate),
-        };
-
-        try {
-          this._callback(
-            this._kind !== 'output' ? inData : null,
-            this._kind !== 'input' ? outData : null,
-            frames,
-            time,
-            0 as CallbackFlag, // status — Web Audio 不提供 underflow/overflow 标志
-          );
-
-          // 将处理结果发回 worklet
-          this._workletNode!.port.postMessage(
-            { type: 'output', outData: outData.buffer },
-            [outData.buffer],
-          );
-        } catch (err) {
-          if (err instanceof Error && err.name === 'CallbackStop') {
-            this._finishedCallback?.();
-            this.stop();
-          } else if (err instanceof Error && err.name === 'CallbackAbort') {
-            this._finishedCallback?.();
-            this.abort();
-          } else {
-            throw err;
-          }
+      if (e.data.type === 'ready') {
+        // Worklet initialized — start polling if callback mode
+        if (this._callback) {
+          this._polling = true;
+          this._pollLoop();
         }
       }
     };
 
+    this._workletNode.port.postMessage({
+      type: 'init',
+      isInput: this._kind === 'input' || this._kind === 'duplex',
+      isOutput: this._kind === 'output' || this._kind === 'duplex',
+      channels: maxCh,
+      blockSize: this._blockSize,
+      inputBuffer: this._inputRb?.sab,
+      outputBuffer: this._outputRb?.sab,
+    }, this._inputRb ? [this._inputRb.sab] : []);
+
+    // Get microphone if needed
+    if (this._kind === 'input' || this._kind === 'duplex') {
+      try {
+        this._mediaStream = await navigator.mediaDevices.getUserMedia({
+          audio: { channelCount: this._inputChannels || 1 },
+        });
+        this._sourceNode = this._ctx.createMediaStreamSource(this._mediaStream);
+        this._sourceNode.connect(this._workletNode);
+      } catch (err) {
+        throw new AudioError(`Microphone access denied: ${err}`);
+      }
+    }
+
+    // Connect to speakers if output
+    if (this._kind === 'output' || this._kind === 'duplex') {
+      this._workletNode.connect(this._ctx.destination);
+    }
+
     this._started = true;
   }
 
+  private _pollLoop(): void {
+    if (!this._polling || this._closed || !this._callback) return;
+
+    try {
+      const isIn = this._kind === 'input' || this._kind === 'duplex';
+      const isOut = this._kind === 'output' || this._kind === 'duplex';
+
+      // Fill multiple blocks per tick to avoid underruns
+      let count = 0;
+      const maxBlocks = 4;
+      while (count < maxBlocks) {
+        let indata: Float32Array | null = null;
+        let outdata: Float32Array | null = null;
+
+        if (isIn && this._inputRb && this._inputRb.hasNewData()) {
+          indata = new Float32Array(this._blockSize * this._inputChannels);
+          this._inputRb.consume(indata, this._blockSize);
+        }
+
+        if (isOut) {
+          outdata = new Float32Array(this._blockSize * this._outputChannels);
+        }
+
+        if (!indata && !outdata) break;
+
+        const now = this._ctx!.currentTime;
+        const streamTime: StreamTime = {
+          inputBufferAdcTime: now,
+          currentTime: now,
+          outputBufferDacTime: now + this._blockSize / this._sampleRate,
+        };
+
+        this._callback(indata, outdata, this._blockSize, streamTime, 0 as CallbackFlag);
+
+        if (isOut && outdata && this._outputRb) {
+          this._outputRb.produce(outdata, this._blockSize);
+        }
+        count++;
+        if (isIn && this._inputRb && !this._inputRb.hasNewData()) break;
+      }
+    } catch (err) {
+      if (err instanceof CallbackStop) {
+        this._polling = false;
+        this._finishedCallback?.();
+        this.stop();
+        return;
+      }
+      if (err instanceof CallbackAbort) {
+        this._polling = false;
+        this._finishedCallback?.();
+        this.abort();
+        return;
+      }
+      this._polling = false;
+      throw err;
+    }
+
+    if (this._polling) {
+      setTimeout(() => this._pollLoop(), 4);
+    }
+  }
+
   stop(): void {
+    this._polling = false;
     this._started = false;
     this._cleanupNodes();
   }
 
   abort(): void {
+    this._polling = false;
     this._started = false;
     this._cleanupNodes();
     this._ctx?.close();
@@ -451,44 +447,27 @@ class WebAudioStream implements IAudioStream {
   }
 
   close(): void {
+    this._polling = false;
     this._started = false;
     this._cleanupNodes();
-    if (this._mediaStream) {
-      this._mediaStream.getTracks().forEach(t => t.stop());
-      this._mediaStream = null;
-    }
+    this._mediaStream?.getTracks().forEach(t => t.stop());
+    this._mediaStream = null;
     this._ctx?.close();
     this._ctx = null;
     this._closed = true;
   }
 
   private _cleanupNodes(): void {
-    if (this._sourceNode) {
-      this._sourceNode.disconnect();
-      this._sourceNode = null;
-    }
-    if (this._workletNode) {
-      this._workletNode.disconnect();
-      this._workletNode.port.onmessage = null;
-      this._workletNode = null;
-    }
+    this._sourceNode?.disconnect();
+    this._sourceNode = null;
+    this._workletNode?.disconnect();
+    this._workletNode = null;
   }
 
-  // 阻塞模式 — Web Audio 不支持
   get readAvailable(): number { return 0; }
   get writeAvailable(): number { return 0; }
-
-  read(_frames: number): Float32Array {
-    throw new AudioError(
-      'Blocking read is not available in the Web Audio backend. Use callback mode.',
-    );
-  }
-
-  write(_buffer: Float32Array): void {
-    throw new AudioError(
-      'Blocking write is not available in the Web Audio backend. Use callback mode.',
-    );
-  }
+  read(): Float32Array { throw new AudioError('Blocking read not supported in Web Audio backend. Use callback mode.'); }
+  write(): void { throw new AudioError('Blocking write not supported in Web Audio backend. Use callback mode.'); }
 }
 
 // ─── WebBackend ───────────────────────────────────
@@ -504,11 +483,7 @@ export class WebBackend implements IBackend {
   };
 
   private _deviceMgr: WebDeviceManager;
-
-  readonly devices: IDeviceManager & {
-    /** 异步刷新设备列表（获取完整标签需要用户手势后调用） */
-    refreshDevices(): Promise<DeviceInfo[]>;
-  };
+  readonly devices: IDeviceManager & { refreshDevices(): Promise<DeviceInfo[]> };
 
   constructor() {
     this._deviceMgr = new WebDeviceManager();
@@ -519,10 +494,7 @@ export class WebBackend implements IBackend {
 
   getVersion(): string { return ''; }
   getVersionText(): string { return 'Web Audio API'; }
-
-  async sleep(msec: number): Promise<void> {
-    return new Promise(resolve => setTimeout(resolve, msec));
-  }
+  async sleep(msec: number): Promise<void> { return new Promise(r => setTimeout(r, msec)); }
 
   openStream(
     kind: StreamKind,
@@ -530,11 +502,8 @@ export class WebBackend implements IBackend {
     callback?: StreamCallback | null,
     finishedCallback?: StreamFinishedCallback | null,
   ): IAudioStream {
-    // Web Audio 只支持回调模式
     if (!callback) {
-      throw new AudioError(
-        'Web Audio backend requires a callback. Blocking mode is not supported in browsers.',
-      );
+      throw new AudioError('Web Audio backend requires a callback. Blocking mode is not supported in browsers.');
     }
     return new WebAudioStream(kind, options, callback, finishedCallback ?? null);
   }

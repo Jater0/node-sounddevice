@@ -229,7 +229,6 @@ class PortAudioStream implements IAudioStream {
     flags: number,
     callback: StreamCallback | null,
     finishedCallback: StreamFinishedCallback | null,
-    extraSettings?: unknown,
   ) {
     this._native = native;
     this._kind = kind;
@@ -245,40 +244,25 @@ class PortAudioStream implements IAudioStream {
       this._sampleSize = sampleSize;
     }
 
-    const idev = Array.isArray(device) ? device[0]! : device;
-    const odev = Array.isArray(device) ? (kind === 'duplex' ? device[1]! : device) : device;
-    const ich = Array.isArray(channels) ? channels[0]! : (kind === 'output' ? 0 : channels);
-    const och = Array.isArray(channels) ? (kind === 'duplex' ? channels[1]! : channels[0]!) : (kind === 'input' ? 0 : channels);
-    const ilat = Array.isArray(latency) ? latency[0]! : latency;
-    const olat = Array.isArray(latency) ? (kind === 'duplex' ? latency[1]! : latency) : latency;
+    const dev = Array.isArray(device) ? device[0]! : device;
+    const ch = Array.isArray(channels) ? channels[0]! : channels;
+    const lat = Array.isArray(latency) ? latency[0]! : latency;
     const isInput = kind === 'input' || kind === 'duplex';
     const isOutput = kind === 'output' || kind === 'duplex';
-
-    // Extract platform-specific settings
-    const es = extraSettings as Record<string, unknown> | undefined;
 
     // Always open in blocking mode.
     // "Callback mode" is simulated by a JS-level polling loop.
     this._handle = native.openStream(
-      idev as number,
-      odev as number,
-      ich as number,
-      och as number,
+      dev,
+      ch,
       this._fmtPa,
       sampleRate,
-      ilat as number,
-      olat as number,
+      lat,
       blockSize,
       flags,
       isInput,
       isOutput,
-      false, // no native callback — we poll from JS
-      es?.type === 'asio' ? (es as { channelSelectors: number[] }).channelSelectors ?? null : null,
-      es?.type === 'coreaudio' ? (es as { channelMap?: number[] }).channelMap ?? null : null,
-      es?.type === 'coreaudio' ? coreaudioFlagsToNum(es as Record<string, unknown>) : null,
-      es?.type === 'wasapi' ? !!(es as { exclusive?: boolean }).exclusive : null,
-      es?.type === 'wasapi' ? !!(es as { autoConvert?: boolean }).autoConvert : null,
-      es?.type === 'wasapi' ? !!(es as { explicitSampleFormat?: boolean }).explicitSampleFormat : null,
+      false,
     );
 
     // Get actual stream info
@@ -286,7 +270,7 @@ class PortAudioStream implements IAudioStream {
     try {
       info = native.getStreamInfo(this._handle);
     } catch {
-      info = { inputLatency: ilat as number, outputLatency: olat as number, sampleRate };
+      info = { inputLatency: lat as number, outputLatency: lat as number, sampleRate };
     }
 
     this._sampleRate = info.sampleRate;
@@ -349,6 +333,14 @@ class PortAudioStream implements IAudioStream {
 
     // If a callback is provided, start the JS-level polling loop
     if (this._callback) {
+      // Prime output buffers with silence to prevent initial underflow
+      if (this._kind !== 'input') {
+        const ch = Array.isArray(this._channels) ? this._channels[1]! : this._channels;
+        const bs = this._blockSize || 256;
+        const silence = new Float32Array(bs * (ch as number));
+        try { this.write(silence); } catch { /* ignore */ }
+        try { this.write(silence); } catch { /* ignore */ }
+      }
       this._polling = true;
       this._pollLoop();
 
@@ -392,7 +384,7 @@ class PortAudioStream implements IAudioStream {
       if (isOutput && this.writeAvailable < frames) frames = this.writeAvailable;
       if (frames <= 0) {
         // Not enough data available yet — try again soon
-        setImmediate(() => this._pollLoop());
+        setTimeout(() => this._pollLoop(), 0);
         return;
       }
 
@@ -443,7 +435,7 @@ class PortAudioStream implements IAudioStream {
 
     // Schedule next poll
     if (this._polling) {
-      setImmediate(() => this._pollLoop());
+      setTimeout(() => this._pollLoop(), 0);
     }
   }
 
@@ -572,7 +564,14 @@ class PortAudioStream implements IAudioStream {
       throw new AudioError(`Unsupported sample format for write: ${this._fmtPa}`);
     }
 
-    this._native.writeStream(this._handle, raw);
+    try {
+      this._native.writeStream(this._handle, raw);
+    } catch (err) {
+      // Output underflow is expected when stream hasn't started consuming yet
+      if (err instanceof Error && !err.message.includes('Output underflowed')) {
+        throw err;
+      }
+    }
   }
 }
 
@@ -730,15 +729,10 @@ export class PortAudioBackend implements IBackend {
       options.primeOutputBuffersUsingStreamCallback ?? defaults.primeOutputBuffersUsingStreamCallback,
     );
 
-    // 平台特定设置
-    const extraSettings = (options as StreamOptions).extraSettings
-      ?? selectFromPair(defaults.extraSettings, kind === 'input' ? 'input' : 'output');
-
     return new PortAudioStream(
       n, kind, dev, channels, dtype, sampleRate,
       blockSize, latency, flags,
       callback ?? null, finishedCallback ?? null,
-      extraSettings ?? undefined,
     );
   }
 }

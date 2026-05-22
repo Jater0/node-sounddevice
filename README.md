@@ -314,12 +314,18 @@ npx tsx examples/play_sine.ts 440
 | `examples/play_sine.ts` | Play a sine wave (Ctrl+C to stop) |
 | `examples/play_file.ts` | Play a WAV file |
 | `examples/record.ts` | Record to a WAV file |
+| `examples/web_demo.html` | Browser demo — list devices + play sine |
 
 ```bash
+# Node.js
 npx tsx examples/list_devices.ts
 npx tsx examples/play_sine.ts 440 --amplitude 0.3
 npx tsx examples/play_file.ts music.wav
 npx tsx examples/record.ts 5 recording.wav
+
+# Browser demo
+npm run serve-web
+# Open http://localhost:8080/examples/web_demo.html
 ```
 
 ---

@@ -39,25 +39,16 @@ export interface NativeAddon {
 
   // 流
   openStream(
-    inputDevice: number,
-    outputDevice: number,
-    inputChannels: number,
-    outputChannels: number,
+    device: number,
+    channels: number,
     sampleFormat: number,
     sampleRate: number,
-    inputLatency: number,
-    outputLatency: number,
+    latency: number,
     blockSize: number,
     flags: number,
     isInput: boolean,
     isOutput: boolean,
     hasCallback: boolean,
-    asioChannelSelectors?: number[] | null,
-    coreaudioChannelMap?: number[] | null,
-    coreaudioFlags?: number | null,
-    wasapiExclusive?: boolean | null,
-    wasapiAutoConvert?: boolean | null,
-    wasapiExplicitSampleFormat?: boolean | null,
   ): number;
   startStream(handle: number): void;
   setStreamFinishedCallback(handle: number): void;
